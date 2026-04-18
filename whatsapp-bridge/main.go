@@ -566,7 +566,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		FileLength: fileLength, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256,
 		MediaType: waMediaType,
 	}
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -691,13 +691,13 @@ func main() {
 	logger.Infof("Starting WhatsApp bridge: account=%s port=%d webhook=%v", account, port, webhookURL != "")
 
 	// whatsmeow session/state lives in the same Postgres schema (whatsmeow_* tables).
-	container, err := sqlstore.New("postgres", dsn, dbLog)
+	container, err := sqlstore.New(context.Background(), "postgres", dsn, dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect whatsmeow store: %v", err)
 		return
 	}
 
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			deviceStore = container.NewDevice()
@@ -817,7 +817,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			}
 		}
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -825,7 +825,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			}
 		}
 	} else {
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

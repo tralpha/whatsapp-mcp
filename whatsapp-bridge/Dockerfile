@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Build context is the repo root (see railway.toml: dockerfilePath = "whatsapp-bridge/Dockerfile").
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25-alpine AS builder
 WORKDIR /src
 COPY whatsapp-bridge/go.mod whatsapp-bridge/go.sum ./
 RUN go mod download

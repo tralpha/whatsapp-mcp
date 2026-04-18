@@ -1,6 +1,6 @@
 [build]
 builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+dockerfilePath = "whatsapp-bridge/Dockerfile"
 
 [deploy]
 restartPolicyType = "ON_FAILURE"

@@ -1,0 +1,5 @@
+whatsapp-client
+bridge
+store/
+*.db
+*.db-journal

@@ -294,11 +294,27 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
-// SendMessageRequest represents the request body for the send message API
+// SendMessageRequest represents the request body for the send message API.
+//
+// Three mutually exclusive (but pairwise-compatible) delivery modes:
+//   1. Text only             — Message is set, no media.
+//   2. Media from filesystem — MediaPath points at a file on the bridge
+//                              container; Message becomes the caption.
+//   3. Media from caller     — MediaBase64 is base64-encoded raw bytes,
+//                              Filename is the original filename (used as
+//                              DocumentMessage.FileName / Title so the
+//                              recipient sees the real name, not a UUID),
+//                              MimeType is optional (derived from filename
+//                              extension when empty). Message becomes caption.
+//
+// MediaBase64 takes priority over MediaPath if both are present.
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient   string `json:"recipient"`
+	Message     string `json:"message"`
+	MediaPath   string `json:"media_path,omitempty"`
+	MediaBase64 string `json:"media_base64,omitempty"`
+	Filename    string `json:"filename,omitempty"`
+	MimeType    string `json:"mime_type,omitempty"`
 }
 
 // WebhookPayload is what we POST to WEBHOOK_URL on every incoming message.
@@ -316,8 +332,80 @@ type WebhookPayload struct {
 	Timestamp   time.Time `json:"timestamp"`
 }
 
-// Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+// maxMediaBytes caps accepted media payload size to protect the bridge from
+// OOM on huge uploads. WhatsApp's own limits are 100 MB for documents and
+// 16 MB for images/videos, but base64 inflates by ~33% and the HTTP server
+// enforces a 25 MB limit on the request body — so raw bytes after decode
+// are realistically under ~18 MB. Set cap a little higher to leave headroom.
+const maxMediaBytes = 25 * 1024 * 1024
+
+// resolveMediaKind maps a filename (by extension) to a whatsmeow.MediaType
+// plus a reasonable mime type. For common document extensions it returns a
+// specific mime (application/pdf, etc.) instead of the
+// application/octet-stream fallback — WhatsApp uses this mime to choose the
+// icon and preview strategy on the recipient's device, so a real mime makes
+// the document render as "PDF / 120 KB" instead of a generic file card.
+func resolveMediaKind(filename string) (whatsmeow.MediaType, string) {
+	idx := strings.LastIndex(filename, ".")
+	if idx < 0 {
+		return whatsmeow.MediaDocument, "application/octet-stream"
+	}
+	ext := strings.ToLower(filename[idx+1:])
+	switch ext {
+	case "jpg", "jpeg":
+		return whatsmeow.MediaImage, "image/jpeg"
+	case "png":
+		return whatsmeow.MediaImage, "image/png"
+	case "gif":
+		return whatsmeow.MediaImage, "image/gif"
+	case "webp":
+		return whatsmeow.MediaImage, "image/webp"
+	case "ogg":
+		return whatsmeow.MediaAudio, "audio/ogg; codecs=opus"
+	case "mp3":
+		return whatsmeow.MediaAudio, "audio/mpeg"
+	case "mp4":
+		return whatsmeow.MediaVideo, "video/mp4"
+	case "avi":
+		return whatsmeow.MediaVideo, "video/avi"
+	case "mov":
+		return whatsmeow.MediaVideo, "video/quicktime"
+	case "pdf":
+		return whatsmeow.MediaDocument, "application/pdf"
+	case "doc":
+		return whatsmeow.MediaDocument, "application/msword"
+	case "docx":
+		return whatsmeow.MediaDocument, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case "xls":
+		return whatsmeow.MediaDocument, "application/vnd.ms-excel"
+	case "xlsx":
+		return whatsmeow.MediaDocument, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case "ppt":
+		return whatsmeow.MediaDocument, "application/vnd.ms-powerpoint"
+	case "pptx":
+		return whatsmeow.MediaDocument, "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case "csv":
+		return whatsmeow.MediaDocument, "text/csv"
+	case "txt":
+		return whatsmeow.MediaDocument, "text/plain"
+	case "zip":
+		return whatsmeow.MediaDocument, "application/zip"
+	default:
+		return whatsmeow.MediaDocument, "application/octet-stream"
+	}
+}
+
+// Function to send a WhatsApp message.
+//
+// When mediaBase64 is set it takes priority over mediaPath: the caller has
+// streamed bytes directly and we should NOT try to read a file. Filename is
+// used as DocumentMessage.FileName / Title so the recipient sees the real
+// name the sender intended (e.g. "Facture Proforma.pdf") rather than a
+// server-generated temp filename.
+func sendWhatsAppMessage(
+	client *whatsmeow.Client,
+	recipient, message, mediaPath, mediaBase64, filename, mimeTypeOverride string,
+) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -335,77 +423,111 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	msg := &waProto.Message{}
-	if mediaPath != "" {
-		mediaData, err := os.ReadFile(mediaPath)
-		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+
+	// Decide which media source to use. Base64 wins over filesystem path so
+	// callers outside the Railway private network (where the bridge's
+	// filesystem is unreachable) can still send media.
+	var mediaData []byte
+	var docFilename string // used for DocumentMessage Title + FileName
+	var mediaType whatsmeow.MediaType
+	var mimeType string
+
+	switch {
+	case mediaBase64 != "":
+		raw, decodeErr := base64.StdEncoding.DecodeString(mediaBase64)
+		if decodeErr != nil {
+			return false, fmt.Sprintf("Invalid base64 payload: %v", decodeErr)
 		}
-		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
-		var mediaType whatsmeow.MediaType
-		var mimeType string
-		switch fileExt {
-		case "jpg", "jpeg":
-			mediaType, mimeType = whatsmeow.MediaImage, "image/jpeg"
-		case "png":
-			mediaType, mimeType = whatsmeow.MediaImage, "image/png"
-		case "gif":
-			mediaType, mimeType = whatsmeow.MediaImage, "image/gif"
-		case "webp":
-			mediaType, mimeType = whatsmeow.MediaImage, "image/webp"
-		case "ogg":
-			mediaType, mimeType = whatsmeow.MediaAudio, "audio/ogg; codecs=opus"
-		case "mp4":
-			mediaType, mimeType = whatsmeow.MediaVideo, "video/mp4"
-		case "avi":
-			mediaType, mimeType = whatsmeow.MediaVideo, "video/avi"
-		case "mov":
-			mediaType, mimeType = whatsmeow.MediaVideo, "video/quicktime"
-		default:
-			mediaType, mimeType = whatsmeow.MediaDocument, "application/octet-stream"
+		if len(raw) > maxMediaBytes {
+			return false, fmt.Sprintf("Media too large: %d bytes (cap %d)", len(raw), maxMediaBytes)
 		}
-		resp, err := client.Upload(context.Background(), mediaData, mediaType)
-		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+		mediaData = raw
+		docFilename = filename
+		if docFilename == "" {
+			// Fallback: no filename provided → invent one from timestamp.
+			// Extension-less so resolveMediaKind falls back to octet-stream.
+			docFilename = fmt.Sprintf("file_%d", time.Now().Unix())
 		}
-		switch mediaType {
-		case whatsmeow.MediaImage:
-			msg.ImageMessage = &waProto.ImageMessage{
-				Caption: proto.String(message), Mimetype: proto.String(mimeType),
-				URL: &resp.URL, DirectPath: &resp.DirectPath, MediaKey: resp.MediaKey,
-				FileEncSHA256: resp.FileEncSHA256, FileSHA256: resp.FileSHA256, FileLength: &resp.FileLength,
-			}
-		case whatsmeow.MediaAudio:
-			var seconds uint32 = 30
-			var waveform []byte
-			if strings.Contains(mimeType, "ogg") {
-				analyzedSeconds, analyzedWaveform, err := analyzeOggOpus(mediaData)
-				if err == nil {
-					seconds, waveform = analyzedSeconds, analyzedWaveform
-				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
-				}
-			}
-			msg.AudioMessage = &waProto.AudioMessage{
-				Mimetype: proto.String(mimeType), URL: &resp.URL, DirectPath: &resp.DirectPath,
-				MediaKey: resp.MediaKey, FileEncSHA256: resp.FileEncSHA256, FileSHA256: resp.FileSHA256,
-				FileLength: &resp.FileLength, Seconds: proto.Uint32(seconds), PTT: proto.Bool(true), Waveform: waveform,
-			}
-		case whatsmeow.MediaVideo:
-			msg.VideoMessage = &waProto.VideoMessage{
-				Caption: proto.String(message), Mimetype: proto.String(mimeType),
-				URL: &resp.URL, DirectPath: &resp.DirectPath, MediaKey: resp.MediaKey,
-				FileEncSHA256: resp.FileEncSHA256, FileSHA256: resp.FileSHA256, FileLength: &resp.FileLength,
-			}
-		case whatsmeow.MediaDocument:
-			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title: proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
-				Caption: proto.String(message), Mimetype: proto.String(mimeType),
-				URL: &resp.URL, DirectPath: &resp.DirectPath, MediaKey: resp.MediaKey,
-				FileEncSHA256: resp.FileEncSHA256, FileSHA256: resp.FileSHA256, FileLength: &resp.FileLength,
-			}
+		mediaType, mimeType = resolveMediaKind(docFilename)
+		if override := strings.TrimSpace(mimeTypeOverride); override != "" {
+			mimeType = override
 		}
-	} else {
+
+		// Persist to a short-lived temp file with 0600 perms. Documents may
+		// contain sensitive data (bank details, passports, contracts) so we
+		// don't want them world-readable even briefly. The file is only used
+		// by analyzeOggOpus for audio — for other media types we could skip
+		// it entirely, but writing + deferring removal keeps the code path
+		// uniform. Cleanup is unconditional even on upload failure.
+		tmpPath, tmpErr := writeSecureTempFile(raw, filepath.Ext(docFilename))
+		if tmpErr != nil {
+			return false, fmt.Sprintf("Error writing temp file: %v", tmpErr)
+		}
+		defer os.Remove(tmpPath)
+
+	case mediaPath != "":
+		data, readErr := os.ReadFile(mediaPath)
+		if readErr != nil {
+			return false, fmt.Sprintf("Error reading media file: %v", readErr)
+		}
+		mediaData = data
+		docFilename = mediaPath[strings.LastIndex(mediaPath, "/")+1:]
+		mediaType, mimeType = resolveMediaKind(docFilename)
+		if override := strings.TrimSpace(mimeTypeOverride); override != "" {
+			mimeType = override
+		}
+
+	default:
+		// Pure text message.
 		msg.Conversation = proto.String(message)
+		_, err = client.SendMessage(context.Background(), recipientJID, msg)
+		if err != nil {
+			return false, fmt.Sprintf("Error sending message: %v", err)
+		}
+		return true, fmt.Sprintf("Message sent to %s", recipient)
+	}
+
+	resp, err := client.Upload(context.Background(), mediaData, mediaType)
+	if err != nil {
+		return false, fmt.Sprintf("Error uploading media: %v", err)
+	}
+	switch mediaType {
+	case whatsmeow.MediaImage:
+		msg.ImageMessage = &waProto.ImageMessage{
+			Caption: proto.String(message), Mimetype: proto.String(mimeType),
+			URL: &resp.URL, DirectPath: &resp.DirectPath, MediaKey: resp.MediaKey,
+			FileEncSHA256: resp.FileEncSHA256, FileSHA256: resp.FileSHA256, FileLength: &resp.FileLength,
+		}
+	case whatsmeow.MediaAudio:
+		var seconds uint32 = 30
+		var waveform []byte
+		if strings.Contains(mimeType, "ogg") {
+			analyzedSeconds, analyzedWaveform, err := analyzeOggOpus(mediaData)
+			if err == nil {
+				seconds, waveform = analyzedSeconds, analyzedWaveform
+			} else {
+				return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+			}
+		}
+		msg.AudioMessage = &waProto.AudioMessage{
+			Mimetype: proto.String(mimeType), URL: &resp.URL, DirectPath: &resp.DirectPath,
+			MediaKey: resp.MediaKey, FileEncSHA256: resp.FileEncSHA256, FileSHA256: resp.FileSHA256,
+			FileLength: &resp.FileLength, Seconds: proto.Uint32(seconds), PTT: proto.Bool(true), Waveform: waveform,
+		}
+	case whatsmeow.MediaVideo:
+		msg.VideoMessage = &waProto.VideoMessage{
+			Caption: proto.String(message), Mimetype: proto.String(mimeType),
+			URL: &resp.URL, DirectPath: &resp.DirectPath, MediaKey: resp.MediaKey,
+			FileEncSHA256: resp.FileEncSHA256, FileSHA256: resp.FileSHA256, FileLength: &resp.FileLength,
+		}
+	case whatsmeow.MediaDocument:
+		msg.DocumentMessage = &waProto.DocumentMessage{
+			Title:    proto.String(docFilename),
+			FileName: proto.String(docFilename),
+			Caption:  proto.String(message), Mimetype: proto.String(mimeType),
+			URL: &resp.URL, DirectPath: &resp.DirectPath, MediaKey: resp.MediaKey,
+			FileEncSHA256: resp.FileEncSHA256, FileSHA256: resp.FileSHA256, FileLength: &resp.FileLength,
+		}
 	}
 
 	_, err = client.SendMessage(context.Background(), recipientJID, msg)
@@ -413,6 +535,35 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// writeSecureTempFile writes bytes to a 0600-mode file in os.TempDir() and
+// returns the path. Caller is responsible for os.Remove(). The extension is
+// preserved so downstream code (e.g. future mime sniffing) can inspect it.
+func writeSecureTempFile(data []byte, ext string) (string, error) {
+	f, err := os.CreateTemp("", "wabridge-*"+ext)
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	// CreateTemp sets 0600 by default on Unix, but set it explicitly in case
+	// umask or the OS default differs. Must be done after CreateTemp (the
+	// file already exists by then).
+	if err := os.Chmod(path, 0o600); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(path)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return "", err
+	}
+	return path, nil
 }
 
 // Extract media info from a message
@@ -761,19 +912,28 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
+		// Accept up to 25 MB (base64 of ~18 MB raw) — matches /api/status
+		// and the backend admin proxy. Without this limit the default
+		// http.Server behaviour is unbounded and callers could OOM the
+		// bridge by streaming a huge body.
+		if err := json.NewDecoder(io.LimitReader(r.Body, 25<<20)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format (or body > 25MB)", http.StatusBadRequest)
 			return
 		}
 		if req.Recipient == "" {
 			http.Error(w, "Recipient is required", http.StatusBadRequest)
 			return
 		}
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+		if req.Message == "" && req.MediaPath == "" && req.MediaBase64 == "" {
+			http.Error(w, "Message, media_path, or media_base64 is required", http.StatusBadRequest)
 			return
 		}
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(
+			client,
+			req.Recipient, req.Message,
+			req.MediaPath, req.MediaBase64,
+			req.Filename, req.MimeType,
+		)
 		w.Header().Set("Content-Type", "application/json")
 		if !success {
 			w.WriteHeader(http.StatusInternalServerError)

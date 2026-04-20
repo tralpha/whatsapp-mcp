@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -717,6 +719,17 @@ func mimeForMediaType(mediaType, filename string) string {
 	}
 }
 
+// respondStatusResult writes a uniform JSON response for /api/status.
+func respondStatusResult(w http.ResponseWriter, err error, okMsg string) {
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "message": okMsg})
+}
+
 // Extract direct path from a WhatsApp media URL
 func extractDirectPathFromURL(url string) string {
 	parts := strings.SplitN(url, ".net/", 2)
@@ -793,37 +806,92 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		_, _ = w.Write(data)
 	})
 
-	// /api/status — post to the user's WhatsApp status (24h stories)
-	// Body: {"message": "text"}  — text-only MVP; extend for media later.
+	// /api/status — post to the user's WhatsApp status (24h stories).
+	// Body:
+	//   Text-only:      {"message": "text"}
+	//   Image status:   {"media_type": "image", "media_base64": "...", "message": "caption (optional)"}
+	//   Video status:   {"media_type": "video", "media_base64": "...", "message": "caption (optional)"}
+	//
+	// Body size limit: 20 MB (post-base64). WhatsApp limits status videos to ~30s / ~16 MB.
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		var req struct {
-			Message string `json:"message"`
+			Message     string `json:"message"`
+			MediaType   string `json:"media_type"`   // "image" | "video" | ""
+			MediaBase64 string `json:"media_base64"` // raw bytes, base64-encoded
+			MimeType    string `json:"mime_type"`    // optional override (e.g. "video/mp4")
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		if err := json.NewDecoder(io.LimitReader(r.Body, 25<<20)).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON (or body > 25MB)", http.StatusBadRequest)
 			return
 		}
-		if strings.TrimSpace(req.Message) == "" {
-			http.Error(w, "message required", http.StatusBadRequest)
+		if req.MediaBase64 == "" && strings.TrimSpace(req.Message) == "" {
+			http.Error(w, "message or media_base64 required", http.StatusBadRequest)
 			return
 		}
 		if !client.IsConnected() {
 			http.Error(w, "Not connected to WhatsApp", http.StatusServiceUnavailable)
 			return
 		}
-		msg := &waProto.Message{Conversation: proto.String(req.Message)}
-		_, err := client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+
+		// Text-only path
+		if req.MediaBase64 == "" {
+			msg := &waProto.Message{Conversation: proto.String(req.Message)}
+			_, err := client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
+			respondStatusResult(w, err, "status posted (text)")
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "status posted"})
+
+		// Media path — decode, upload to WA CDN, wrap in Image/Video message.
+		mediaBytes, err := base64.StdEncoding.DecodeString(req.MediaBase64)
+		if err != nil {
+			http.Error(w, "media_base64 is not valid base64", http.StatusBadRequest)
+			return
+		}
+		mediaType := strings.ToLower(strings.TrimSpace(req.MediaType))
+		if mediaType != "image" && mediaType != "video" {
+			http.Error(w, `media_type must be "image" or "video"`, http.StatusBadRequest)
+			return
+		}
+		mime := strings.TrimSpace(req.MimeType)
+		if mime == "" {
+			if mediaType == "image" {
+				mime = "image/jpeg"
+			} else {
+				mime = "video/mp4"
+			}
+		}
+		var waType whatsmeow.MediaType
+		if mediaType == "image" {
+			waType = whatsmeow.MediaImage
+		} else {
+			waType = whatsmeow.MediaVideo
+		}
+		up, err := client.Upload(context.Background(), mediaBytes, waType)
+		if err != nil {
+			respondStatusResult(w, fmt.Errorf("upload: %w", err), "")
+			return
+		}
+		msg := &waProto.Message{}
+		switch mediaType {
+		case "image":
+			msg.ImageMessage = &waProto.ImageMessage{
+				Caption: proto.String(req.Message), Mimetype: proto.String(mime),
+				URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
+				FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
+			}
+		case "video":
+			msg.VideoMessage = &waProto.VideoMessage{
+				Caption: proto.String(req.Message), Mimetype: proto.String(mime),
+				URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
+				FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
+			}
+		}
+		_, err = client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
+		respondStatusResult(w, err, fmt.Sprintf("status posted (%s, %d bytes)", mediaType, len(mediaBytes)))
 	})
 
 	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {

@@ -782,19 +782,30 @@ func sanitizePhone(raw string) string {
 	return string(out)
 }
 
-// pairingCodeLoop requests a fresh pairing code every minute until paired.
-// Pairing codes rotate ~60s; loop keeps a valid code always available in logs.
+// pairingCodeLoop requests a fresh pairing code until paired.
+//
+// Backoff policy matters: WhatsApp rate-limits PairPhone aggressively (429
+// rate-overlimit after ~3 consecutive calls). On any error, we use
+// exponential backoff capped at 15 minutes. On success we sleep 55s (code
+// rotates every ~60s).
 func pairingCodeLoop(client *whatsmeow.Client, phone string, logger waLog.Logger) {
+	errorBackoff := 60 * time.Second
+	const maxBackoff = 15 * time.Minute
 	for {
 		if client.IsLoggedIn() {
 			return
 		}
 		code, err := client.PairPhone(context.Background(), phone, true, whatsmeow.PairClientChrome, "Vita Resort Bridge")
 		if err != nil {
-			logger.Warnf("PairPhone failed: %v — retrying in 15s", err)
-			time.Sleep(15 * time.Second)
+			logger.Warnf("PairPhone failed: %v — retrying in %v", err, errorBackoff)
+			time.Sleep(errorBackoff)
+			errorBackoff *= 2
+			if errorBackoff > maxBackoff {
+				errorBackoff = maxBackoff
+			}
 			continue
 		}
+		errorBackoff = 60 * time.Second // reset on success
 		fmt.Println("")
 		fmt.Println("╔══════════════════════════════════════════════════════╗")
 		fmt.Printf("║  PAIRING CODE: %-36s  ║\n", code)

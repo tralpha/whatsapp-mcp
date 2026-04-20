@@ -576,6 +576,72 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
+// fetchMediaBytes fetches + decrypts media for a message and returns it as raw bytes.
+// Streams cleanly through the HTTP handler — no filesystem intermediate.
+func fetchMediaBytes(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (mediaType, filename string, data []byte, err error) {
+	mt, fn, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, metaErr := messageStore.GetMediaInfo(messageID, chatJID)
+	if metaErr != nil {
+		return "", "", nil, fmt.Errorf("message not found: %w", metaErr)
+	}
+	if mt == "" {
+		return "", "", nil, fmt.Errorf("message is not a media message")
+	}
+	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
+		return "", "", nil, fmt.Errorf("incomplete media metadata; cannot decrypt")
+	}
+	var wt whatsmeow.MediaType
+	switch mt {
+	case "image":
+		wt = whatsmeow.MediaImage
+	case "video":
+		wt = whatsmeow.MediaVideo
+	case "audio":
+		wt = whatsmeow.MediaAudio
+	case "document":
+		wt = whatsmeow.MediaDocument
+	default:
+		return "", "", nil, fmt.Errorf("unsupported media type: %s", mt)
+	}
+	downloader := &MediaDownloader{
+		URL: url, DirectPath: extractDirectPathFromURL(url), MediaKey: mediaKey,
+		FileLength: fileLength, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256,
+		MediaType: wt,
+	}
+	bytes, dlErr := client.Download(context.Background(), downloader)
+	if dlErr != nil {
+		return "", "", nil, fmt.Errorf("decrypt/download failed: %w", dlErr)
+	}
+	return mt, fn, bytes, nil
+}
+
+// mimeForMediaType maps whatsmeow media types to reasonable Content-Type defaults.
+// Filename extension wins when available — this is just a fallback.
+func mimeForMediaType(mediaType, filename string) string {
+	lower := strings.ToLower(filename)
+	switch {
+	case strings.HasSuffix(lower, ".pdf"):
+		return "application/pdf"
+	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+		return "image/jpeg"
+	case strings.HasSuffix(lower, ".png"):
+		return "image/png"
+	case strings.HasSuffix(lower, ".mp4"):
+		return "video/mp4"
+	case strings.HasSuffix(lower, ".ogg"):
+		return "audio/ogg"
+	}
+	switch mediaType {
+	case "image":
+		return "image/jpeg"
+	case "video":
+		return "video/mp4"
+	case "audio":
+		return "audio/ogg"
+	default:
+		return "application/octet-stream"
+	}
+}
+
 // Extract direct path from a WhatsApp media URL
 func extractDirectPathFromURL(url string) string {
 	parts := strings.SplitN(url, ".net/", 2)
@@ -625,6 +691,64 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	// /api/media?message_id=...&chat_jid=...
+	// Streams decrypted media bytes back. Replaces /api/download for callers
+	// that want the file content inline (e.g. backend admin proxy).
+	mux.HandleFunc("/api/media", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		msgID := r.URL.Query().Get("message_id")
+		chatJID := r.URL.Query().Get("chat_jid")
+		if msgID == "" || chatJID == "" {
+			http.Error(w, "message_id and chat_jid required", http.StatusBadRequest)
+			return
+		}
+		mediaType, filename, data, err := fetchMediaBytes(client, messageStore, msgID, chatJID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", mimeForMediaType(mediaType, filename))
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filename))
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	})
+
+	// /api/status — post to the user's WhatsApp status (24h stories)
+	// Body: {"message": "text"}  — text-only MVP; extend for media later.
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Message string `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.Message) == "" {
+			http.Error(w, "message required", http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() {
+			http.Error(w, "Not connected to WhatsApp", http.StatusServiceUnavailable)
+			return
+		}
+		msg := &waProto.Message{Conversation: proto.String(req.Message)}
+		_, err := client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "status posted"})
 	})
 
 	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {

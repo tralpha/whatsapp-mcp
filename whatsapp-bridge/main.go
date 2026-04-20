@@ -682,6 +682,11 @@ func main() {
 	webhookURL := os.Getenv("WEBHOOK_URL")
 	webhookSecret := os.Getenv("WEBHOOK_SECRET")
 
+	// Optional: if set, pair via 8-char pairing code instead of QR.
+	// Set to the phone number in international format (digits only, no +), e.g. "237659099178".
+	// More reliable than QR because it's immune to terminal/log unicode corruption.
+	pairPhone := sanitizePhone(os.Getenv("PAIR_PHONE"))
+
 	port, err := strconv.Atoi(envOrDefault("PORT", "8080"))
 	if err != nil {
 		logger.Errorf("invalid PORT: %v", err)
@@ -728,62 +733,113 @@ func main() {
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger)
 		case *events.Connected:
-			logger.Infof("Connected to WhatsApp")
+			logger.Infof("✓ Connected to WhatsApp")
+		case *events.PairSuccess:
+			logger.Infof("✓ Paired successfully (device: %s)", v.ID.String())
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			logger.Warnf("Device logged out (reason: %v). Restart bridge or wait for auto-reconnect.", v.Reason)
 		}
 	})
 
-	connected := make(chan bool, 1)
+	// Start REST server up-front so /api/health responds during pairing.
+	startRESTServer(client, messageStore, port)
 
-	if client.Store.ID == nil {
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\n=========== SCAN THIS QR CODE WITH YOUR WHATSAPP APP ===========")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				fmt.Println("================================================================")
-			} else if evt.Event == "success" {
-				connected <- true
-				break
-			}
-		}
-		select {
-		case <-connected:
-			fmt.Println("\n✓ Successfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
-		}
-	} else {
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-		connected <- true
-	}
-
-	time.Sleep(2 * time.Second)
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
+	// Connect unconditionally. whatsmeow drives pairing + reconnect from this point.
+	if err := client.Connect(); err != nil {
+		logger.Errorf("Failed to connect: %v", err)
 		return
 	}
 
-	startRESTServer(client, messageStore, port)
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	if client.Store.ID == nil {
+		// Not paired yet. Prefer pairing code if PAIR_PHONE is set; QR otherwise.
+		// Container stays alive indefinitely until paired — no timeout that kills main().
+		if pairPhone != "" {
+			go pairingCodeLoop(client, pairPhone, logger)
+		} else {
+			go qrCodeLoop(client, logger)
+		}
+	} else {
+		logger.Infof("Existing session found (device: %s) — reconnecting", client.Store.ID.String())
+	}
 
+	fmt.Println("Bridge is running. Ctrl+C to exit.")
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 	<-exitChan
 
 	fmt.Println("Disconnecting...")
 	client.Disconnect()
+}
+
+// sanitizePhone keeps only digits (strips +, spaces, dashes).
+func sanitizePhone(raw string) string {
+	var out []rune
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			out = append(out, r)
+		}
+	}
+	return string(out)
+}
+
+// pairingCodeLoop requests a fresh pairing code every minute until paired.
+// Pairing codes rotate ~60s; loop keeps a valid code always available in logs.
+func pairingCodeLoop(client *whatsmeow.Client, phone string, logger waLog.Logger) {
+	for {
+		if client.IsLoggedIn() {
+			return
+		}
+		code, err := client.PairPhone(context.Background(), phone, true, whatsmeow.PairClientChrome, "Vita Resort Bridge")
+		if err != nil {
+			logger.Warnf("PairPhone failed: %v — retrying in 15s", err)
+			time.Sleep(15 * time.Second)
+			continue
+		}
+		fmt.Println("")
+		fmt.Println("╔══════════════════════════════════════════════════════╗")
+		fmt.Printf("║  PAIRING CODE: %-36s  ║\n", code)
+		fmt.Println("╠══════════════════════════════════════════════════════╣")
+		fmt.Println("║  On your phone:                                      ║")
+		fmt.Println("║    WhatsApp → Settings → Linked Devices              ║")
+		fmt.Println("║      → Link a Device                                 ║")
+		fmt.Println("║      → Link with phone number instead                ║")
+		fmt.Println("║      → enter the code above                          ║")
+		fmt.Println("╚══════════════════════════════════════════════════════╝")
+		fmt.Println("")
+		// Code lasts ~60s. Sleep 55s then regenerate if still unpaired.
+		time.Sleep(55 * time.Second)
+	}
+}
+
+// qrCodeLoop prints fresh QR codes indefinitely until paired.
+// Uses full-block qrterminal.Generate (wider but more robust to log-pipeline
+// unicode corruption than GenerateHalfBlock).
+func qrCodeLoop(client *whatsmeow.Client, logger waLog.Logger) {
+	for {
+		if client.IsLoggedIn() {
+			return
+		}
+		qrChan, err := client.GetQRChannel(context.Background())
+		if err != nil {
+			logger.Warnf("GetQRChannel failed: %v — retrying in 15s", err)
+			time.Sleep(15 * time.Second)
+			continue
+		}
+		for evt := range qrChan {
+			switch evt.Event {
+			case "code":
+				fmt.Println("")
+				fmt.Println("=========== SCAN THIS QR CODE WITH YOUR WHATSAPP APP ===========")
+				qrterminal.Generate(evt.Code, qrterminal.L, os.Stdout)
+				fmt.Println("================================================================")
+				fmt.Println("If the QR above looks corrupted, set PAIR_PHONE env var to use a pairing code instead.")
+				fmt.Println("")
+			case "success":
+				return
+			}
+		}
+		// Channel closed (typically after ~3 min). Loop to get fresh QRs.
+	}
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info

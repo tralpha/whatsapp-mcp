@@ -1156,9 +1156,14 @@ func qrPairingLoop(client *whatsmeow.Client, logger waLog.Logger) {
 			case "code":
 				fmt.Println("")
 				fmt.Println("=========== SCAN THIS QR CODE WITH YOUR WHATSAPP APP ===========")
-				qrterminal.Generate(evt.Code, qrterminal.L, os.Stdout)
+				// Half-block rendering: ~half the height/width of Generate().
+				// More compact but requires a terminal that renders ▀▄█ at 1:1 cell width.
+				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				fmt.Println("================================================================")
-				fmt.Println("If the QR above looks corrupted, set PAIR_PHONE env var (digits-only phone number) to use a pairing code instead.")
+				fmt.Println("If the QR above looks corrupted in your terminal, paste the")
+				fmt.Println("text below into https://qrcode.show or any QR generator:")
+				fmt.Println("")
+				fmt.Println(evt.Code)
 				fmt.Println("")
 			case "success":
 				return

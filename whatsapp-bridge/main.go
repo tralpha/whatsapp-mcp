@@ -1151,19 +1151,31 @@ func qrPairingLoop(client *whatsmeow.Client, logger waLog.Logger) {
 			time.Sleep(15 * time.Second)
 			continue
 		}
+		// Throttle QR prints — whatsmeow emits a fresh code every ~20s, but
+		// each code stays valid for ~60s, so printing every rotation just
+		// scrolls your terminal faster than you can scan. One print per 45s
+		// gives a comfortable window: user always has a valid QR on screen
+		// without getting a new one pushed before they finish scanning.
+		var lastPrint time.Time
 		for evt := range qrChan {
 			switch evt.Event {
 			case "code":
+				if !lastPrint.IsZero() && time.Since(lastPrint) < 45*time.Second {
+					continue
+				}
+				lastPrint = time.Now()
 				fmt.Println("")
 				fmt.Println("=========== SCAN THIS QR CODE WITH YOUR WHATSAPP APP ===========")
-				// Half-block rendering: ~half the height/width of Generate().
-				// More compact but requires a terminal that renders ▀▄█ at 1:1 cell width.
+				// Half-block: ~half the height/width of Generate(). Compact but
+				// requires a terminal that renders ▀▄█ at 1:1 cell width.
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				fmt.Println("================================================================")
 				fmt.Println("If the QR above looks corrupted in your terminal, paste the")
 				fmt.Println("text below into https://qrcode.show or any QR generator:")
 				fmt.Println("")
 				fmt.Println(evt.Code)
+				fmt.Println("")
+				fmt.Println("(next QR in ~45s if this one isn't scanned)")
 				fmt.Println("")
 			case "success":
 				return

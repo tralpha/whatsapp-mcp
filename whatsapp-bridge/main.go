@@ -102,6 +102,21 @@ func NewMessageStore(dsn string) (*MessageStore, error) {
 			file_length BIGINT,
 			PRIMARY KEY (id, chat_jid)
 		);
+		CREATE TABLE IF NOT EXISTS calls (
+			call_id TEXT PRIMARY KEY,
+			from_jid TEXT NOT NULL,
+			call_creator TEXT,
+			is_group BOOLEAN DEFAULT FALSE,
+			media TEXT,
+			offered_at TIMESTAMPTZ,
+			accepted_at TIMESTAMPTZ,
+			terminated_at TIMESTAMPTZ,
+			rejected_at TIMESTAMPTZ,
+			terminate_reason TEXT,
+			platform TEXT,
+			version TEXT
+		);
+		CREATE INDEX IF NOT EXISTS calls_offered_at_idx ON calls (offered_at DESC);
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create tables: %w", err)
@@ -196,6 +211,66 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 		chats[jid] = lastMessageTime
 	}
 	return chats, nil
+}
+
+// RecordCallOffer upserts the initial CALL row when an incoming WhatsApp call arrives.
+// Both CallOffer (1:1) and CallOfferNotice (group/offline) land here.
+func (store *MessageStore) RecordCallOffer(callID, fromJID, callCreator, media, platform, version string, isGroup bool, ts time.Time) error {
+	if callID == "" {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO calls (call_id, from_jid, call_creator, is_group, media, offered_at, platform, version)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		 ON CONFLICT (call_id) DO UPDATE SET
+		   from_jid = EXCLUDED.from_jid,
+		   call_creator = COALESCE(NULLIF(EXCLUDED.call_creator,''), calls.call_creator),
+		   is_group = EXCLUDED.is_group,
+		   media = COALESCE(NULLIF(EXCLUDED.media,''), calls.media),
+		   offered_at = COALESCE(calls.offered_at, EXCLUDED.offered_at),
+		   platform = COALESCE(NULLIF(EXCLUDED.platform,''), calls.platform),
+		   version = COALESCE(NULLIF(EXCLUDED.version,''), calls.version)`,
+		callID, fromJID, callCreator, isGroup, media, ts, platform, version,
+	)
+	return err
+}
+
+// RecordCallAccept stamps the moment the call was picked up.
+func (store *MessageStore) RecordCallAccept(callID string, ts time.Time) error {
+	if callID == "" {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`UPDATE calls SET accepted_at = $2 WHERE call_id = $1 AND accepted_at IS NULL`,
+		callID, ts,
+	)
+	return err
+}
+
+// RecordCallReject stamps the moment the callee rejected the call.
+func (store *MessageStore) RecordCallReject(callID string, ts time.Time) error {
+	if callID == "" {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`UPDATE calls SET rejected_at = $2 WHERE call_id = $1 AND rejected_at IS NULL`,
+		callID, ts,
+	)
+	return err
+}
+
+// RecordCallTerminate stamps the moment the call ended + its reason.
+// With accepted_at NULL, terminate means the call was missed (never picked up).
+func (store *MessageStore) RecordCallTerminate(callID, reason string, ts time.Time) error {
+	if callID == "" {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`UPDATE calls SET terminated_at = $2, terminate_reason = $3
+		 WHERE call_id = $1 AND terminated_at IS NULL`,
+		callID, ts, reason,
+	)
+	return err
 }
 
 // Extract text content from a message
@@ -862,6 +937,41 @@ func main() {
 			logger.Infof("✓ Paired successfully (device: %s)", v.ID.String())
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out (reason: %v). Restart bridge or wait for auto-reconnect.", v.Reason)
+		case *events.CallOffer:
+			// 1:1 incoming call. Media type not in BasicCallMeta; leave blank (filled
+			// by CallOfferNotice when that also fires for same call_id).
+			if err := messageStore.RecordCallOffer(
+				v.CallID, v.From.String(), v.CallCreator.String(),
+				"", v.RemotePlatform, v.RemoteVersion, false, v.Timestamp,
+			); err != nil {
+				logger.Warnf("RecordCallOffer: %v", err)
+			}
+			fmt.Printf("[%s] ☎  call offer from %s (id=%s)\n", v.Timestamp.Format("2006-01-02 15:04:05"), v.From.User, v.CallID)
+		case *events.CallOfferNotice:
+			// Fires for group calls or when the device was offline at the time
+			// of a 1:1 offer. Carries Media ("audio"|"video") and Type ("group").
+			isGroup := v.Type == "group"
+			if err := messageStore.RecordCallOffer(
+				v.CallID, v.From.String(), v.CallCreator.String(),
+				v.Media, "", "", isGroup, v.Timestamp,
+			); err != nil {
+				logger.Warnf("RecordCallOffer (notice): %v", err)
+			}
+			fmt.Printf("[%s] ☎  call notice (%s%s) from %s (id=%s)\n",
+				v.Timestamp.Format("2006-01-02 15:04:05"), v.Media, map[bool]string{true: ", group", false: ""}[isGroup], v.From.User, v.CallID)
+		case *events.CallAccept:
+			if err := messageStore.RecordCallAccept(v.CallID, v.Timestamp); err != nil {
+				logger.Warnf("RecordCallAccept: %v", err)
+			}
+		case *events.CallReject:
+			if err := messageStore.RecordCallReject(v.CallID, v.Timestamp); err != nil {
+				logger.Warnf("RecordCallReject: %v", err)
+			}
+		case *events.CallTerminate:
+			if err := messageStore.RecordCallTerminate(v.CallID, v.Reason, v.Timestamp); err != nil {
+				logger.Warnf("RecordCallTerminate: %v", err)
+			}
+			fmt.Printf("[%s] ☎  call terminated (id=%s reason=%s)\n", v.Timestamp.Format("2006-01-02 15:04:05"), v.CallID, v.Reason)
 		}
 	})
 

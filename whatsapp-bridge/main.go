@@ -744,22 +744,25 @@ func main() {
 	// Start REST server up-front so /api/health responds during pairing.
 	startRESTServer(client, messageStore, port)
 
-	// Connect unconditionally. whatsmeow drives pairing + reconnect from this point.
-	if err := client.Connect(); err != nil {
-		logger.Errorf("Failed to connect: %v", err)
-		return
-	}
-
-	if client.Store.ID == nil {
-		// Not paired yet. Prefer pairing code if PAIR_PHONE is set; QR otherwise.
-		// Container stays alive indefinitely until paired — no timeout that kills main().
-		if pairPhone != "" {
-			go pairingCodeLoop(client, pairPhone, logger)
-		} else {
-			go qrCodeLoop(client, logger)
-		}
-	} else {
+	// whatsmeow has a strict rule: GetQRChannel must be called BEFORE Connect.
+	// So we split three code paths:
+	//   1. Already paired (Store.ID != nil) → Connect only.
+	//   2. Unpaired + PAIR_PHONE set          → Connect then pairingCodeLoop.
+	//   3. Unpaired + no PAIR_PHONE            → qrPairingLoop owns Connect lifecycle.
+	if client.Store.ID != nil {
 		logger.Infof("Existing session found (device: %s) — reconnecting", client.Store.ID.String())
+		if err := client.Connect(); err != nil {
+			logger.Errorf("Failed to connect: %v", err)
+			return
+		}
+	} else if pairPhone != "" {
+		if err := client.Connect(); err != nil {
+			logger.Errorf("Failed to connect: %v", err)
+			return
+		}
+		go pairingCodeLoop(client, pairPhone, logger)
+	} else {
+		go qrPairingLoop(client, logger)
 	}
 
 	fmt.Println("Bridge is running. Ctrl+C to exit.")
@@ -822,10 +825,15 @@ func pairingCodeLoop(client *whatsmeow.Client, phone string, logger waLog.Logger
 	}
 }
 
-// qrCodeLoop prints fresh QR codes indefinitely until paired.
-// Uses full-block qrterminal.Generate (wider but more robust to log-pipeline
-// unicode corruption than GenerateHalfBlock).
-func qrCodeLoop(client *whatsmeow.Client, logger waLog.Logger) {
+// qrPairingLoop owns the full connect/pair lifecycle for QR-based pairing.
+//
+// whatsmeow requires GetQRChannel to be called BEFORE Connect, and a channel
+// only produces codes for ~3 minutes total before closing. To offer unlimited
+// scan attempts, we repeat: (GetQRChannel → Connect → drain → Disconnect).
+//
+// Exits when IsLoggedIn is true (paired successfully). The main goroutine
+// stays blocked on the signal channel, so the container lives indefinitely.
+func qrPairingLoop(client *whatsmeow.Client, logger waLog.Logger) {
 	for {
 		if client.IsLoggedIn() {
 			return
@@ -836,6 +844,11 @@ func qrCodeLoop(client *whatsmeow.Client, logger waLog.Logger) {
 			time.Sleep(15 * time.Second)
 			continue
 		}
+		if err := client.Connect(); err != nil {
+			logger.Warnf("Connect failed: %v — retrying in 15s", err)
+			time.Sleep(15 * time.Second)
+			continue
+		}
 		for evt := range qrChan {
 			switch evt.Event {
 			case "code":
@@ -843,13 +856,17 @@ func qrCodeLoop(client *whatsmeow.Client, logger waLog.Logger) {
 				fmt.Println("=========== SCAN THIS QR CODE WITH YOUR WHATSAPP APP ===========")
 				qrterminal.Generate(evt.Code, qrterminal.L, os.Stdout)
 				fmt.Println("================================================================")
-				fmt.Println("If the QR above looks corrupted, set PAIR_PHONE env var to use a pairing code instead.")
+				fmt.Println("If the QR above looks corrupted, set PAIR_PHONE env var (digits-only phone number) to use a pairing code instead.")
 				fmt.Println("")
 			case "success":
 				return
 			}
 		}
-		// Channel closed (typically after ~3 min). Loop to get fresh QRs.
+		// Channel closed (codes exhausted). Disconnect before re-requesting a
+		// fresh channel; whatsmeow requires the client to be in the right
+		// state for GetQRChannel to work again.
+		client.Disconnect()
+		time.Sleep(5 * time.Second)
 	}
 }
 

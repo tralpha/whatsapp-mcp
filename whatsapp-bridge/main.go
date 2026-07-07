@@ -292,6 +292,11 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	// MessageID is the WhatsApp server message ID assigned by whatsmeow once
+	// the send is accepted. Callers treat a non-empty MessageID as proof the
+	// message was actually accepted by WhatsApp (not merely that the HTTP call
+	// returned 200), and only then mark their own log row "sent".
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API.
@@ -404,10 +409,11 @@ func resolveMediaKind(filename string) (whatsmeow.MediaType, string) {
 // server-generated temp filename.
 func sendWhatsAppMessage(
 	client *whatsmeow.Client,
+	messageStore *MessageStore,
 	recipient, message, mediaPath, mediaBase64, filename, mimeTypeOverride string,
-) (bool, string) {
+) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", ""
 	}
 
 	var recipientJID types.JID
@@ -416,10 +422,30 @@ func sendWhatsAppMessage(
 	if isJID {
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
 		}
 	} else {
-		recipientJID = types.JID{User: recipient, Server: "s.whatsapp.net"}
+		// Resolve the canonical WhatsApp JID for a bare phone number. Sending to
+		// a naively-built {User: number}@s.whatsapp.net JID silently fails to
+		// deliver when the number's real account lives under a different JID/LID
+		// (observed on cold first-contact OTA guests: WhatsApp accepts the send
+		// and returns an ID, but nobody receives it). IsOnWhatsApp returns the
+		// canonical JID and whether the number is registered at all.
+		resolved, registered, checkErr := resolveViaIsOnWhatsApp(client, recipient)
+		switch {
+		case checkErr != nil:
+			// usync / network blip. Fall back to the naive JID rather than block
+			// a send that may well succeed; the caller's retry loop is the
+			// backstop.
+			recipientJID = types.JID{User: recipient, Server: "s.whatsapp.net"}
+		case !registered:
+			// Definitive negative. Surface a terminal "not registered" error so
+			// the caller marks the number unreachable and alerts a human instead
+			// of phantom-succeeding.
+			return false, fmt.Sprintf("recipient not registered on whatsapp: %s", recipient), ""
+		default:
+			recipientJID = resolved
+		}
 	}
 
 	msg := &waProto.Message{}
@@ -436,10 +462,10 @@ func sendWhatsAppMessage(
 	case mediaBase64 != "":
 		raw, decodeErr := base64.StdEncoding.DecodeString(mediaBase64)
 		if decodeErr != nil {
-			return false, fmt.Sprintf("Invalid base64 payload: %v", decodeErr)
+			return false, fmt.Sprintf("Invalid base64 payload: %v", decodeErr), ""
 		}
 		if len(raw) > maxMediaBytes {
-			return false, fmt.Sprintf("Media too large: %d bytes (cap %d)", len(raw), maxMediaBytes)
+			return false, fmt.Sprintf("Media too large: %d bytes (cap %d)", len(raw), maxMediaBytes), ""
 		}
 		mediaData = raw
 		docFilename = filename
@@ -461,14 +487,14 @@ func sendWhatsAppMessage(
 		// uniform. Cleanup is unconditional even on upload failure.
 		tmpPath, tmpErr := writeSecureTempFile(raw, filepath.Ext(docFilename))
 		if tmpErr != nil {
-			return false, fmt.Sprintf("Error writing temp file: %v", tmpErr)
+			return false, fmt.Sprintf("Error writing temp file: %v", tmpErr), ""
 		}
 		defer os.Remove(tmpPath)
 
 	case mediaPath != "":
 		data, readErr := os.ReadFile(mediaPath)
 		if readErr != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", readErr)
+			return false, fmt.Sprintf("Error reading media file: %v", readErr), ""
 		}
 		mediaData = data
 		docFilename = mediaPath[strings.LastIndex(mediaPath, "/")+1:]
@@ -480,16 +506,17 @@ func sendWhatsAppMessage(
 	default:
 		// Pure text message.
 		msg.Conversation = proto.String(message)
-		_, err = client.SendMessage(context.Background(), recipientJID, msg)
+		resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 		if err != nil {
-			return false, fmt.Sprintf("Error sending message: %v", err)
+			return false, fmt.Sprintf("Error sending message: %v", err), ""
 		}
-		return true, fmt.Sprintf("Message sent to %s", recipient)
+		persistOutbound(client, messageStore, resp.ID, recipientJID, message, "", "")
+		return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID
 	}
 
 	resp, err := client.Upload(context.Background(), mediaData, mediaType)
 	if err != nil {
-		return false, fmt.Sprintf("Error uploading media: %v", err)
+		return false, fmt.Sprintf("Error uploading media: %v", err), ""
 	}
 	switch mediaType {
 	case whatsmeow.MediaImage:
@@ -506,7 +533,7 @@ func sendWhatsAppMessage(
 			if err == nil {
 				seconds, waveform = analyzedSeconds, analyzedWaveform
 			} else {
-				return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+				return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
 			}
 		}
 		msg.AudioMessage = &waProto.AudioMessage{
@@ -530,11 +557,70 @@ func sendWhatsAppMessage(
 		}
 	}
 
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), ""
 	}
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	persistOutbound(client, messageStore, sendResp.ID, recipientJID, message, mediaTypeLabel(mediaType), docFilename)
+	return true, fmt.Sprintf("Message sent to %s", recipient), sendResp.ID
+}
+
+// resolveViaIsOnWhatsApp queries WhatsApp for the canonical JID of a bare phone
+// number. Returns (canonicalJID, isRegistered, err). A nil error with
+// isRegistered=false is a definitive "this number is not on WhatsApp". A
+// non-nil error means the query itself failed (network / usync) and the caller
+// should decide whether to proceed optimistically.
+func resolveViaIsOnWhatsApp(client *whatsmeow.Client, phone string) (types.JID, bool, error) {
+	digits := strings.TrimPrefix(strings.TrimSpace(phone), "+")
+	if digits == "" {
+		return types.JID{}, false, fmt.Errorf("empty phone")
+	}
+	results, err := client.IsOnWhatsApp(context.Background(), []string{"+" + digits})
+	if err != nil {
+		return types.JID{}, false, err
+	}
+	if len(results) == 0 {
+		return types.JID{}, false, nil
+	}
+	return results[0].JID, results[0].IsIn, nil
+}
+
+// persistOutbound records a message this bridge just sent into the messages
+// table with is_from_me=true. whatsmeow does NOT echo the client's own sends
+// back as events, so without this every /api/send was invisible in the DB —
+// which made a "sent" log row impossible to verify against real delivery.
+// Best-effort: a persistence failure never fails the send.
+func persistOutbound(client *whatsmeow.Client, store *MessageStore, msgID string, chatJID types.JID, content, mediaType, filename string) {
+	if store == nil || msgID == "" {
+		return
+	}
+	var sender string
+	if client.Store != nil && client.Store.ID != nil {
+		sender = client.Store.ID.User
+	}
+	if err := store.StoreMessage(
+		msgID, chatJID.String(), sender, content, time.Now(), true,
+		mediaType, filename, "", nil, nil, nil, 0,
+	); err != nil {
+		fmt.Printf("[send] persist outbound %s failed: %v\n", msgID, err)
+	}
+}
+
+// mediaTypeLabel maps whatsmeow's MediaType to the short string the messages
+// table stores for the media_type column (matches extractMediaInfo's values).
+func mediaTypeLabel(mt whatsmeow.MediaType) string {
+	switch mt {
+	case whatsmeow.MediaImage:
+		return "image"
+	case whatsmeow.MediaVideo:
+		return "video"
+	case whatsmeow.MediaAudio:
+		return "audio"
+	case whatsmeow.MediaDocument:
+		return "document"
+	default:
+		return ""
+	}
 }
 
 // writeSecureTempFile writes bytes to a 0600-mode file in os.TempDir() and
@@ -928,8 +1014,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			http.Error(w, "Message, media_path, or media_base64 is required", http.StatusBadRequest)
 			return
 		}
-		success, message := sendWhatsAppMessage(
+		success, message, messageID := sendWhatsAppMessage(
 			client,
+			messageStore,
 			req.Recipient, req.Message,
 			req.MediaPath, req.MediaBase64,
 			req.Filename, req.MimeType,
@@ -938,7 +1025,47 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if !success {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
-		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message, MessageID: messageID})
+	})
+
+	// /api/check?phone=<E.164 digits, optional leading +>
+	// Authoritative "is this number on WhatsApp?" probe. Backs the intake
+	// dispatcher's pre-flight reachability gate so a not-yet-reachable number
+	// defers (and alerts a human) instead of burning its single idempotent
+	// send attempt on a message nobody receives.
+	mux.HandleFunc("/api/check", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		phone := strings.TrimSpace(r.URL.Query().Get("phone"))
+		if phone == "" {
+			http.Error(w, "phone query param required", http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() {
+			// 503 → callers treat as "can't answer authoritatively", proceed optimistically.
+			http.Error(w, "Not connected to WhatsApp", http.StatusServiceUnavailable)
+			return
+		}
+		resolved, registered, err := resolveViaIsOnWhatsApp(client, phone)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			// 502 → not a registration answer, just a failed query. Callers
+			// proceed optimistically and let the send surface the real status.
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"on_whatsapp": false, "error": err.Error()})
+			return
+		}
+		jidStr := ""
+		if registered {
+			jidStr = resolved.String()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"on_whatsapp": registered,
+			"jid":         jidStr,
+			"input":       phone,
+		})
 	})
 
 	// /api/media?message_id=...&chat_jid=...

@@ -332,6 +332,17 @@ type ReactRequest struct {
 	Reaction  string `json:"reaction"`   // emoji, e.g. "❤️"; empty clears the reaction
 }
 
+// StatusReplyRequest is the body for /api/status-reply. A status reply is a
+// normal ExtendedTextMessage sent to the poster's DM, carrying a ContextInfo
+// that threads it to their status@broadcast post.
+type StatusReplyRequest struct {
+	Recipient       string `json:"recipient"`         // digits of the poster's phone, routes the DM
+	StatusMessageID string `json:"status_message_id"` // the status post's id
+	Participant     string `json:"participant"`       // poster's JID as stored on the status row's sender
+	Message         string `json:"message"`           // the reply text
+	QuotedType      string `json:"quoted_type"`       // optional: "image" | "video" | "text" (best-effort context)
+}
+
 // WebhookPayload is what we POST to WEBHOOK_URL on every incoming message.
 type WebhookPayload struct {
 	Account     string    `json:"account"`
@@ -1089,6 +1100,103 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Reaction sent", MessageID: resp.ID})
+	})
+
+	// /api/status-reply — reply to someone's status/story. This is a normal DM
+	// to the poster carrying a ContextInfo that threads it to their status post
+	// (StanzaID + RemoteJID "status@broadcast" + Participant). QuotedMessage is
+	// best-effort: we do not persist the original status payload, so at most a
+	// minimal placeholder of the given kind is attached. The reply still threads
+	// via StanzaID without it. Returns the same shape as /api/react.
+	mux.HandleFunc("/api/status-reply", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req StatusReplyRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || req.StatusMessageID == "" || req.Participant == "" || req.Message == "" {
+			http.Error(w, "recipient, status_message_id, participant, and message are required", http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "Not connected to WhatsApp"})
+			return
+		}
+
+		// Resolve the poster's DM JID from the recipient digits, the same way
+		// /api/send does (canonical-JID lookup, naive fallback on lookup blips).
+		var dmJID types.JID
+		var err error
+		if strings.Contains(req.Recipient, "@") {
+			dmJID, err = types.ParseJID(req.Recipient)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error parsing recipient: %v", err), http.StatusBadRequest)
+				return
+			}
+		} else {
+			resolved, registered, checkErr := resolveViaIsOnWhatsApp(client, req.Recipient)
+			switch {
+			case checkErr != nil:
+				dmJID = types.JID{User: req.Recipient, Server: "s.whatsapp.net"}
+			case !registered:
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("recipient not registered on whatsapp: %s", req.Recipient)})
+				return
+			default:
+				dmJID = resolved
+			}
+		}
+
+		// Participant is the poster's JID as stored on the status row's sender.
+		// It may be a bare LID/number or a full JID; tolerate both like /api/react.
+		var participantJID types.JID
+		if strings.Contains(req.Participant, "@") {
+			participantJID, err = types.ParseJID(req.Participant)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error parsing participant: %v", err), http.StatusBadRequest)
+				return
+			}
+		} else {
+			participantJID = types.JID{User: req.Participant, Server: "s.whatsapp.net"}
+		}
+
+		ctxInfo := &waProto.ContextInfo{
+			StanzaID:    proto.String(req.StatusMessageID),
+			RemoteJID:   proto.String("status@broadcast"),
+			Participant: proto.String(participantJID.String()),
+		}
+		// Best-effort quoted context. We have no original payload, so attach a
+		// minimal placeholder of the requested kind. Omitted leaves it nil.
+		switch req.QuotedType {
+		case "image":
+			ctxInfo.QuotedMessage = &waProto.Message{ImageMessage: &waProto.ImageMessage{}}
+		case "video":
+			ctxInfo.QuotedMessage = &waProto.Message{VideoMessage: &waProto.VideoMessage{}}
+		case "text":
+			ctxInfo.QuotedMessage = &waProto.Message{Conversation: proto.String(req.Message)}
+		}
+
+		msg := &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text:        proto.String(req.Message),
+				ContextInfo: ctxInfo,
+			},
+		}
+		resp, err := client.SendMessage(context.Background(), dmJID, msg)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error sending status reply: %v", err)})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Status reply sent", MessageID: resp.ID})
 	})
 
 	// /api/check?phone=<E.164 digits, optional leading +>

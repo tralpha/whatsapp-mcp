@@ -322,6 +322,16 @@ type SendMessageRequest struct {
 	MimeType    string `json:"mime_type,omitempty"`
 }
 
+// ReactRequest is the body for /api/react. The caller already has all fields
+// from its messages table, so they are passed explicitly rather than
+// re-resolved. An empty Reaction clears a previously sent reaction.
+type ReactRequest struct {
+	ChatJID   string `json:"chat_jid"`   // full chat JID the target message lives in
+	MessageID string `json:"message_id"` // target message's id
+	Sender    string `json:"sender"`     // JID of the original message's sender
+	Reaction  string `json:"reaction"`   // emoji, e.g. "❤️"; empty clears the reaction
+}
+
 // WebhookPayload is what we POST to WEBHOOK_URL on every incoming message.
 type WebhookPayload struct {
 	Account     string    `json:"account"`
@@ -1026,6 +1036,59 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message, MessageID: messageID})
+	})
+
+	// /api/react — react to a message with an emoji (tap-and-hold ❤️).
+	// An empty "reaction" clears a previously sent reaction (whatsmeow's
+	// documented remove semantics). Returns the same success/message_id shape
+	// as /api/send.
+	mux.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req ReactRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" || req.Sender == "" {
+			http.Error(w, "chat_jid, message_id, and sender are required", http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "Not connected to WhatsApp"})
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing chat_jid: %v", err), http.StatusBadRequest)
+			return
+		}
+		// Sender is normally a full JID from the caller's messages table. Tolerate
+		// a bare number by appending the default WhatsApp server.
+		var senderJID types.JID
+		if strings.Contains(req.Sender, "@") {
+			senderJID, err = types.ParseJID(req.Sender)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error parsing sender: %v", err), http.StatusBadRequest)
+				return
+			}
+		} else {
+			senderJID = types.JID{User: req.Sender, Server: "s.whatsapp.net"}
+		}
+
+		reactionMsg := client.BuildReaction(chatJID, senderJID, req.MessageID, req.Reaction)
+		resp, err := client.SendMessage(context.Background(), chatJID, reactionMsg)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error sending reaction: %v", err)})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Reaction sent", MessageID: resp.ID})
 	})
 
 	// /api/check?phone=<E.164 digits, optional leading +>

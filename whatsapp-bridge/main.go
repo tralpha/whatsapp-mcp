@@ -343,6 +343,18 @@ type StatusReplyRequest struct {
 	QuotedType      string `json:"quoted_type"`       // optional: "image" | "video" | "text" (best-effort context)
 }
 
+// ReplyRequest is the body for /api/reply. A quoted reply is a normal
+// ExtendedTextMessage sent to the chat, carrying a ContextInfo that quotes a
+// specific earlier message (StanzaID + Participant + QuotedMessage). The
+// caller has all fields from its messages table.
+type ReplyRequest struct {
+	ChatJID    string `json:"chat_jid"`    // full chat JID the reply and quoted message live in
+	MessageID  string `json:"message_id"`  // id of the message being replied to
+	Sender     string `json:"sender"`      // JID of the quoted message's sender
+	QuotedText string `json:"quoted_text"` // text of the quoted message (best-effort context, may be empty)
+	Message    string `json:"message"`     // the reply text
+}
+
 // WebhookPayload is what we POST to WEBHOOK_URL on every incoming message.
 type WebhookPayload struct {
 	Account     string    `json:"account"`
@@ -1197,6 +1209,74 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Status reply sent", MessageID: resp.ID})
+	})
+
+	// /api/reply — reply to a specific earlier message in a chat, quoting it
+	// (the swipe-to-reply gesture in the app). Sends an ExtendedTextMessage to
+	// the chat with a ContextInfo that references the quoted message
+	// (StanzaID + Participant + QuotedMessage). QuotedText is best-effort: pass
+	// the original message's text so the quote renders; empty still threads via
+	// StanzaID. Returns the same shape as /api/react.
+	mux.HandleFunc("/api/reply", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req ReplyRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" || req.Sender == "" || req.Message == "" {
+			http.Error(w, "chat_jid, message_id, sender, and message are required", http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "Not connected to WhatsApp"})
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing chat_jid: %v", err), http.StatusBadRequest)
+			return
+		}
+		// Sender is the quoted message's author, as stored on the messages row.
+		// Tolerate a bare number like /api/react and /api/status-reply.
+		var senderJID types.JID
+		if strings.Contains(req.Sender, "@") {
+			senderJID, err = types.ParseJID(req.Sender)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error parsing sender: %v", err), http.StatusBadRequest)
+				return
+			}
+		} else {
+			senderJID = types.JID{User: req.Sender, Server: "s.whatsapp.net"}
+		}
+
+		ctxInfo := &waProto.ContextInfo{
+			StanzaID:    proto.String(req.MessageID),
+			Participant: proto.String(senderJID.String()),
+		}
+		if req.QuotedText != "" {
+			ctxInfo.QuotedMessage = &waProto.Message{Conversation: proto.String(req.QuotedText)}
+		}
+
+		msg := &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text:        proto.String(req.Message),
+				ContextInfo: ctxInfo,
+			},
+		}
+		resp, err := client.SendMessage(context.Background(), chatJID, msg)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error sending reply: %v", err)})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Reply sent", MessageID: resp.ID})
 	})
 
 	// /api/check?phone=<E.164 digits, optional leading +>

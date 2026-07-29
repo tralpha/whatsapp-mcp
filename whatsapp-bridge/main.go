@@ -119,6 +119,12 @@ func NewMessageStore(dsn string) (*MessageStore, error) {
 			version TEXT
 		);
 		CREATE INDEX IF NOT EXISTS calls_offered_at_idx ON calls (offered_at DESC);
+		CREATE TABLE IF NOT EXISTS status_views (
+			status_message_id TEXT,
+			viewer_jid TEXT,
+			viewed_at TIMESTAMPTZ,
+			PRIMARY KEY (status_message_id, viewer_jid)
+		);
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create tables: %w", err)
@@ -213,6 +219,95 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 		chats[jid] = lastMessageTime
 	}
 	return chats, nil
+}
+
+// StatusRow is one status others posted, read back from the messages table.
+type StatusRow struct {
+	MessageID string    `json:"message_id"`
+	Sender    string    `json:"sender"`
+	MediaType string    `json:"media_type"`
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// GetStatuses returns recent statuses others posted (chat_jid = status@broadcast,
+// not from us), newest first.
+func (store *MessageStore) GetStatuses(limit int) ([]StatusRow, error) {
+	rows, err := store.db.Query(
+		`SELECT id, sender, media_type, content, timestamp
+		 FROM messages WHERE chat_jid = 'status@broadcast' AND is_from_me = false
+		 ORDER BY timestamp DESC LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	statuses := []StatusRow{}
+	for rows.Next() {
+		var s StatusRow
+		if err := rows.Scan(&s.MessageID, &s.Sender, &s.MediaType, &s.Content, &s.Timestamp); err != nil {
+			return nil, err
+		}
+		statuses = append(statuses, s)
+	}
+	return statuses, nil
+}
+
+// RecordStatusView upserts one (status_message_id, viewer) row when someone
+// views our status. Capture is forward-only: no backfill of views before deploy.
+func (store *MessageStore) RecordStatusView(statusMessageID, viewerJID string, viewedAt time.Time) error {
+	if statusMessageID == "" || viewerJID == "" {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO status_views (status_message_id, viewer_jid, viewed_at)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (status_message_id, viewer_jid) DO UPDATE SET viewed_at = EXCLUDED.viewed_at`,
+		statusMessageID, viewerJID, viewedAt,
+	)
+	return err
+}
+
+// StatusView is one viewer of one status post.
+type StatusView struct {
+	ViewerJID string    `json:"viewer_jid"`
+	ViewedAt  time.Time `json:"viewed_at"`
+}
+
+// GetStatusViews returns viewers of our statuses. If messageID is set, only that
+// post's viewers; otherwise the latest 100 rows across all posts. Newest first.
+func (store *MessageStore) GetStatusViews(messageID string, limit int) ([]StatusView, error) {
+	var rows *sql.Rows
+	var err error
+	if messageID != "" {
+		rows, err = store.db.Query(
+			`SELECT viewer_jid, viewed_at FROM status_views
+			 WHERE status_message_id = $1 ORDER BY viewed_at DESC LIMIT $2`,
+			messageID, limit,
+		)
+	} else {
+		rows, err = store.db.Query(
+			`SELECT viewer_jid, viewed_at FROM status_views
+			 ORDER BY viewed_at DESC LIMIT $1`,
+			limit,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	views := []StatusView{}
+	for rows.Next() {
+		var v StatusView
+		if err := rows.Scan(&v.ViewerJID, &v.ViewedAt); err != nil {
+			return nil, err
+		}
+		views = append(views, v)
+	}
+	return views, nil
 }
 
 // RecordCallOffer upserts the initial CALL row when an incoming WhatsApp call arrives.
@@ -353,6 +448,15 @@ type ReplyRequest struct {
 	Sender     string `json:"sender"`      // JID of the quoted message's sender
 	QuotedText string `json:"quoted_text"` // text of the quoted message (best-effort context, may be empty)
 	Message    string `json:"message"`     // the reply text
+}
+
+// StatusReactRequest is the body for /api/status-react. Reacting to a status is
+// a normal reaction whose target key lives in status@broadcast: chat is the
+// status broadcast JID, sender is the poster, id is the status post id.
+type StatusReactRequest struct {
+	StatusMessageID string `json:"status_message_id"` // the status post's id
+	Participant     string `json:"participant"`       // poster's JID (tolerate bare number)
+	Reaction        string `json:"reaction"`          // emoji; empty clears
 }
 
 // WebhookPayload is what we POST to WEBHOOK_URL on every incoming message.
@@ -1279,6 +1383,100 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Reply sent", MessageID: resp.ID})
 	})
 
+	// /api/status-react — react to someone's status/story with an emoji (the
+	// status reaction bar). This is a normal reaction whose target key lives in
+	// status@broadcast: the reaction chat is StatusBroadcastJID, the reacted
+	// message's sender is the poster, the id is the status post id. An empty
+	// "reaction" clears it. Returns the same shape as /api/react.
+	mux.HandleFunc("/api/status-react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req StatusReactRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.StatusMessageID == "" || req.Participant == "" {
+			http.Error(w, "status_message_id and participant are required", http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: "Not connected to WhatsApp"})
+			return
+		}
+		// Participant is the poster's JID. Tolerate a bare number like /api/react.
+		var participantJID types.JID
+		var err error
+		if strings.Contains(req.Participant, "@") {
+			participantJID, err = types.ParseJID(req.Participant)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Error parsing participant: %v", err), http.StatusBadRequest)
+				return
+			}
+		} else {
+			participantJID = types.JID{User: req.Participant, Server: "s.whatsapp.net"}
+		}
+
+		reactionMsg := client.BuildReaction(types.StatusBroadcastJID, participantJID, req.StatusMessageID, req.Reaction)
+		resp, err := client.SendMessage(context.Background(), types.StatusBroadcastJID, reactionMsg)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error sending status reaction: %v", err)})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Status reaction sent", MessageID: resp.ID})
+	})
+
+	// /api/statuses?limit=N — recent statuses others posted, from our own
+	// message store. Read-only. Default 30, cap 100.
+	mux.HandleFunc("/api/statuses", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		limit := 30
+		if l := strings.TrimSpace(r.URL.Query().Get("limit")); l != "" {
+			if n, err := strconv.Atoi(l); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		if limit > 100 {
+			limit = 100
+		}
+		statuses, err := messageStore.GetStatuses(limit)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"statuses": statuses})
+	})
+
+	// /api/status-views?message_id=<id> — viewers of our statuses, newest first.
+	// With message_id: that post's viewers. Without: latest 100 rows overall.
+	// Read-only. Capture is forward-only (see the Receipt handler).
+	mux.HandleFunc("/api/status-views", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		messageID := strings.TrimSpace(r.URL.Query().Get("message_id"))
+		views, err := messageStore.GetStatusViews(messageID, 100)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"viewers": views})
+	})
+
 	// /api/check?phone=<E.164 digits, optional leading +>
 	// Authoritative "is this number on WhatsApp?" probe. Backs the intake
 	// dispatcher's pre-flight reachability gate so a not-yet-reachable number
@@ -1578,6 +1776,19 @@ func main() {
 				logger.Warnf("RecordCallTerminate: %v", err)
 			}
 			fmt.Printf("[%s] ☎  call terminated (id=%s reason=%s)\n", v.Timestamp.Format("2006-01-02 15:04:05"), v.CallID, v.Reason)
+		case *events.Receipt:
+			// A read/played receipt whose chat is status@broadcast means someone
+			// viewed OUR status. MessageIDs reference our status posts; the viewer
+			// is the receipt sender. Capture is forward-only (no backfill).
+			if v.MessageSource.Chat.String() == "status@broadcast" &&
+				(v.Type == types.ReceiptTypeRead || v.Type == types.ReceiptTypePlayed) {
+				viewer := v.MessageSource.Sender.String()
+				for _, mid := range v.MessageIDs {
+					if err := messageStore.RecordStatusView(mid, viewer, v.Timestamp); err != nil {
+						logger.Warnf("RecordStatusView: %v", err)
+					}
+				}
+			}
 		}
 	})
 

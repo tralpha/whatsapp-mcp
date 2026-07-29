@@ -553,36 +553,20 @@ func sendWhatsAppMessage(
 		return false, "Not connected to WhatsApp", ""
 	}
 
-	var recipientJID types.JID
-	var err error
-	isJID := strings.Contains(recipient, "@")
-	if isJID {
-		recipientJID, err = types.ParseJID(recipient)
-		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
-		}
-	} else {
-		// Resolve the canonical WhatsApp JID for a bare phone number. Sending to
-		// a naively-built {User: number}@s.whatsapp.net JID silently fails to
-		// deliver when the number's real account lives under a different JID/LID
-		// (observed on cold first-contact OTA guests: WhatsApp accepts the send
-		// and returns an ID, but nobody receives it). IsOnWhatsApp returns the
-		// canonical JID and whether the number is registered at all.
-		resolved, registered, checkErr := resolveViaIsOnWhatsApp(client, recipient)
-		switch {
-		case checkErr != nil:
-			// usync / network blip. Fall back to the naive JID rather than block
-			// a send that may well succeed; the caller's retry loop is the
-			// backstop.
-			recipientJID = types.JID{User: recipient, Server: "s.whatsapp.net"}
-		case !registered:
-			// Definitive negative. Surface a terminal "not registered" error so
-			// the caller marks the number unreachable and alerts a human instead
-			// of phantom-succeeding.
-			return false, fmt.Sprintf("recipient not registered on whatsapp: %s", recipient), ""
-		default:
-			recipientJID = resolved
-		}
+	recipientJID, registered, resolveErr := resolveCanonicalChatJID(client, recipient)
+	switch {
+	case resolveErr != nil && strings.Contains(recipient, "@"):
+		return false, fmt.Sprintf("Error parsing JID: %v", resolveErr), ""
+	case resolveErr != nil:
+		// usync / network blip. Fall back to the naive JID rather than block
+		// a send that may well succeed; the caller's retry loop is the
+		// backstop.
+		recipientJID = types.JID{User: recipient, Server: "s.whatsapp.net"}
+	case !registered:
+		// Definitive negative. Surface a terminal "not registered" error so
+		// the caller marks the number unreachable and alerts a human instead
+		// of phantom-succeeding.
+		return false, fmt.Sprintf("recipient not registered on whatsapp: %s", recipient), ""
 	}
 
 	msg := &waProto.Message{}
@@ -700,6 +684,49 @@ func sendWhatsAppMessage(
 	}
 	persistOutbound(client, messageStore, sendResp.ID, recipientJID, message, mediaTypeLabel(mediaType), docFilename)
 	return true, fmt.Sprintf("Message sent to %s", recipient), sendResp.ID
+}
+
+// resolveCanonicalChatJID resolves a recipient to the JID that inbound messages
+// from that contact are already filed under, so a thread does not split across
+// two chat_jid values. WhatsApp files a DM under the contact's LID once their
+// account is LID-migrated, so inbound rows land on <lid>@lid while a phone-based
+// send stores <digits>@s.whatsapp.net: same conversation, two chat_jid values,
+// and a querier reading one of them silently sees half the thread.
+//
+// Preferring the LID is not a behaviour change on the wire: whatsmeow's own
+// SendMessage already swaps a phone destination for the LID before sending
+// (send.go, via Store.LIDs.GetLIDForPN) whenever the account is LID-migrated.
+// We just do the swap early enough that the JID we persist matches the one we
+// sent to.
+//
+// Returns (canonicalJID, isRegistered, err) with the same contract as
+// resolveViaIsOnWhatsApp. A recipient that already contains "@" is parsed and
+// returned untouched. Any LID-lookup failure degrades to the phone JID rather
+// than failing the send.
+func resolveCanonicalChatJID(client *whatsmeow.Client, recipient string) (types.JID, bool, error) {
+	if strings.Contains(recipient, "@") {
+		jid, err := types.ParseJID(recipient)
+		return jid, err == nil, err
+	}
+	resolved, registered, err := resolveViaIsOnWhatsApp(client, recipient)
+	if err != nil || !registered {
+		return resolved, registered, err
+	}
+	return preferLID(client, resolved), true, nil
+}
+
+// preferLID swaps a phone JID for the contact's LID when whatsmeow's own LID
+// store already knows the mapping. Best-effort: an unmapped contact, a store
+// error, or a JID that is not a phone JID returns the input unchanged.
+func preferLID(client *whatsmeow.Client, jid types.JID) types.JID {
+	if jid.Server != types.DefaultUserServer || client.Store == nil || client.Store.LIDs == nil {
+		return jid
+	}
+	lid, err := client.Store.LIDs.GetLIDForPN(context.Background(), jid)
+	if err != nil || lid.IsEmpty() {
+		return jid
+	}
+	return lid
 }
 
 // resolveViaIsOnWhatsApp queries WhatsApp for the canonical JID of a bare phone
@@ -1256,7 +1283,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				return
 			}
 		} else {
-			resolved, registered, checkErr := resolveViaIsOnWhatsApp(client, req.Recipient)
+			resolved, registered, checkErr := resolveCanonicalChatJID(client, req.Recipient)
 			switch {
 			case checkErr != nil:
 				dmJID = types.JID{User: req.Recipient, Server: "s.whatsapp.net"}

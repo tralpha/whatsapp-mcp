@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1565,6 +1566,67 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 		w.Header().Set("Content-Type", mimeForMediaType(mediaType, filename))
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, filename))
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	})
+
+	// /api/profile-photo?phone=<E.164 digits, optional leading +>
+	// Fetches a WhatsApp user's profile picture and streams the JPEG bytes
+	// back. Resolves phone -> JID the same way /api/check does. If the user
+	// has no profile picture set, responds 200 with {"has_photo": false}
+	// instead of an error.
+	mux.HandleFunc("/api/profile-photo", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		phone := strings.TrimSpace(r.URL.Query().Get("phone"))
+		if phone == "" {
+			http.Error(w, "phone query param required", http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() {
+			http.Error(w, "Not connected to WhatsApp", http.StatusServiceUnavailable)
+			return
+		}
+		jid, registered, err := resolveViaIsOnWhatsApp(client, phone)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if !registered {
+			http.Error(w, "phone is not on WhatsApp", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		info, err := client.GetProfilePictureInfo(context.Background(), jid, &whatsmeow.GetProfilePictureParams{})
+		if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"has_photo": false})
+			return
+		}
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		if info == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"has_photo": false})
+			return
+		}
+		resp, err := http.Get(info.URL)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
 		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		_, _ = w.Write(data)
 	})

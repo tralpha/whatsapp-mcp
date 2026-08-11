@@ -126,6 +126,13 @@ func NewMessageStore(dsn string) (*MessageStore, error) {
 			viewed_at TIMESTAMPTZ,
 			PRIMARY KEY (status_message_id, viewer_jid)
 		);
+		CREATE TABLE IF NOT EXISTS status_reactions (
+			status_message_id TEXT,
+			reactor_jid TEXT,
+			reaction TEXT,
+			reacted_at TIMESTAMPTZ,
+			PRIMARY KEY (status_message_id, reactor_jid)
+		);
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create tables: %w", err)
@@ -309,6 +316,60 @@ func (store *MessageStore) GetStatusViews(messageID string, limit int) ([]Status
 		views = append(views, v)
 	}
 	return views, nil
+}
+
+// RecordStatusReaction upserts one (status_message_id, reactor) row when someone
+// reacts to our status. An empty reaction means they cleared it, matching
+// /api/status-react's own empty-reaction-clears semantics: delete the row
+// instead of storing an empty one.
+func (store *MessageStore) RecordStatusReaction(statusMessageID, reactorJID, reaction string, reactedAt time.Time) error {
+	if statusMessageID == "" || reactorJID == "" {
+		return nil
+	}
+	if reaction == "" {
+		_, err := store.db.Exec(
+			`DELETE FROM status_reactions WHERE status_message_id = $1 AND reactor_jid = $2`,
+			statusMessageID, reactorJID,
+		)
+		return err
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO status_reactions (status_message_id, reactor_jid, reaction, reacted_at)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (status_message_id, reactor_jid) DO UPDATE SET reaction = EXCLUDED.reaction, reacted_at = EXCLUDED.reacted_at`,
+		statusMessageID, reactorJID, reaction, reactedAt,
+	)
+	return err
+}
+
+// StatusReaction is one reactor's emoji on one of our status posts.
+type StatusReaction struct {
+	ReactorJID string    `json:"reactor_jid"`
+	Reaction   string    `json:"reaction"`
+	ReactedAt  time.Time `json:"reacted_at"`
+}
+
+// GetStatusReactions returns reactions to one of our status posts, newest first.
+func (store *MessageStore) GetStatusReactions(messageID string, limit int) ([]StatusReaction, error) {
+	rows, err := store.db.Query(
+		`SELECT reactor_jid, reaction, reacted_at FROM status_reactions
+		 WHERE status_message_id = $1 ORDER BY reacted_at DESC LIMIT $2`,
+		messageID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	reactions := []StatusReaction{}
+	for rows.Next() {
+		var r StatusReaction
+		if err := rows.Scan(&r.ReactorJID, &r.Reaction, &r.ReactedAt); err != nil {
+			return nil, err
+		}
+		reactions = append(reactions, r)
+	}
+	return reactions, nil
 }
 
 // RecordCallOffer upserts the initial CALL row when an incoming WhatsApp call arrives.
@@ -887,6 +948,28 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	if err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp); err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
+	}
+
+	// A reaction to one of OUR status posts arrives as a Message whose chat is
+	// status@broadcast, carrying a ReactionMessage (not a Conversation/ExtendedText,
+	// so it would otherwise fall through the empty-content guard below and be
+	// silently dropped, same as any other reaction). Mirrors the Receipt handler's
+	// status-view capture: chat == status@broadcast on an inbound event only
+	// happens for posts we own, so no extra participant check is needed. This is
+	// separate from ordinary chat-message reactions, which stay ignored.
+	if reaction := msg.Message.GetReactionMessage(); reaction != nil && msg.Info.Chat.String() == "status@broadcast" {
+		statusMessageID := reaction.GetKey().GetID()
+		reactionEmoji := reaction.GetText()
+		if err := messageStore.RecordStatusReaction(statusMessageID, sender, reactionEmoji, msg.Info.Timestamp); err != nil {
+			logger.Warnf("RecordStatusReaction: %v", err)
+		}
+		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
+		if reactionEmoji == "" {
+			fmt.Printf("[%s] ⭐ %s cleared reaction on status %s\n", timestamp, sender, statusMessageID)
+		} else {
+			fmt.Printf("[%s] ⭐ %s reacted %s to status %s\n", timestamp, sender, reactionEmoji, statusMessageID)
+		}
+		return
 	}
 
 	content := extractTextContent(msg.Message)
@@ -1503,6 +1586,24 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"viewers": views})
+	})
+
+	// /api/status-reactions?message_id=<id> — reactions to one of our status
+	// posts, newest first. Read-only. Capture is forward-only (see handleMessage).
+	mux.HandleFunc("/api/status-reactions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		messageID := strings.TrimSpace(r.URL.Query().Get("message_id"))
+		reactions, err := messageStore.GetStatusReactions(messageID, 100)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"reactions": reactions})
 	})
 
 	// /api/check?phone=<E.164 digits, optional leading +>

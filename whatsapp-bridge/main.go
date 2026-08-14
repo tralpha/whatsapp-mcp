@@ -87,8 +87,10 @@ func NewMessageStore(dsn string) (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMPTZ
+			last_message_time TIMESTAMPTZ,
+			last_read_at TIMESTAMPTZ
 		);
+		ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -151,6 +153,17 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 		`INSERT INTO chats (jid, name, last_message_time) VALUES ($1, $2, $3)
 		 ON CONFLICT (jid) DO UPDATE SET name = EXCLUDED.name, last_message_time = EXCLUDED.last_message_time`,
 		jid, name, lastMessageTime,
+	)
+	return err
+}
+
+// UpdateLastRead records when a chat was last marked read, from a read
+// receipt on any of the user's own linked devices (multi-device sync).
+// Monotonic: never moves last_read_at backwards.
+func (store *MessageStore) UpdateLastRead(chatJID string, readAt time.Time) error {
+	_, err := store.db.Exec(
+		`UPDATE chats SET last_read_at = $1 WHERE jid = $2 AND (last_read_at IS NULL OR last_read_at < $1)`,
+		readAt, chatJID,
 	)
 	return err
 }
@@ -227,6 +240,68 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 		chats[jid] = lastMessageTime
 	}
 	return chats, nil
+}
+
+// UnreadMessage is one message newer than a chat's last_read_at.
+type UnreadMessage struct {
+	Timestamp time.Time `json:"timestamp"`
+	Sender    string    `json:"sender"`
+	Content   string    `json:"content"`
+}
+
+// UnreadChat groups a chat's unread messages, using last_read_at synced from
+// read receipts on any of the user's linked devices (see UpdateLastRead). A
+// null last_read_at means the chat has never been marked read, so every
+// inbound message counts as unread.
+type UnreadChat struct {
+	ChatJID    string          `json:"chat_jid"`
+	ChatName   string          `json:"chat_name"`
+	LastReadAt *time.Time      `json:"last_read_at"`
+	Messages   []UnreadMessage `json:"messages"`
+}
+
+// GetUnreadChats returns, per 1:1 chat (groups and status excluded), the
+// inbound messages newer than the chat's last_read_at.
+func (store *MessageStore) GetUnreadChats() ([]UnreadChat, error) {
+	rows, err := store.db.Query(`
+		SELECT m.chat_jid, c.name, c.last_read_at, m.timestamp, m.sender, m.content
+		FROM messages m
+		JOIN chats c ON c.jid = m.chat_jid
+		WHERE m.is_from_me = false
+		  AND c.jid NOT LIKE '%@g.us'
+		  AND c.jid <> 'status@broadcast'
+		  AND m.timestamp > COALESCE(c.last_read_at, '-infinity')
+		ORDER BY m.chat_jid, m.timestamp ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	order := []string{}
+	byChat := map[string]*UnreadChat{}
+	for rows.Next() {
+		var chatJID, name, sender, content string
+		var lastReadAt sql.NullTime
+		var ts time.Time
+		if err := rows.Scan(&chatJID, &name, &lastReadAt, &ts, &sender, &content); err != nil {
+			return nil, err
+		}
+		uc, ok := byChat[chatJID]
+		if !ok {
+			uc = &UnreadChat{ChatJID: chatJID, ChatName: name}
+			if lastReadAt.Valid {
+				uc.LastReadAt = &lastReadAt.Time
+			}
+			byChat[chatJID] = uc
+			order = append(order, chatJID)
+		}
+		uc.Messages = append(uc.Messages, UnreadMessage{Timestamp: ts, Sender: sender, Content: content})
+	}
+	result := make([]UnreadChat, 0, len(order))
+	for _, jid := range order {
+		result = append(result, *byChat[jid])
+	}
+	return result, nil
 }
 
 // StatusRow is one status others posted, read back from the messages table.
@@ -1606,6 +1681,24 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		_ = json.NewEncoder(w).Encode(map[string]any{"reactions": reactions})
 	})
 
+	// /api/unread — genuinely unread messages per 1:1 chat (groups and status
+	// excluded), computed against last_read_at synced from read receipts on
+	// any of the user's linked devices, not an arbitrary query-time cutoff.
+	mux.HandleFunc("/api/unread", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		unread, err := messageStore.GetUnreadChats()
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(unread)
+	})
+
 	// /api/check?phone=<E.164 digits, optional leading +>
 	// Authoritative "is this number on WhatsApp?" probe. Backs the intake
 	// dispatcher's pre-flight reachability gate so a not-yet-reachable number
@@ -1977,6 +2070,15 @@ func main() {
 					if err := messageStore.RecordStatusView(mid, viewer, v.Timestamp); err != nil {
 						logger.Warnf("RecordStatusView: %v", err)
 					}
+				}
+			} else if v.MessageSource.IsFromMe && v.MessageSource.Chat.String() != "status@broadcast" &&
+				(v.Type == types.ReceiptTypeRead || v.Type == types.ReceiptTypeReadSelf ||
+					v.Type == types.ReceiptTypePlayed || v.Type == types.ReceiptTypePlayedSelf) {
+				// IsFromMe here means the receipt itself was sent by us (i.e. one of
+				// our own linked devices), not that we sent the message being read —
+				// this is the multi-device "chat marked read elsewhere" sync signal.
+				if err := messageStore.UpdateLastRead(v.MessageSource.Chat.String(), v.Timestamp); err != nil {
+					logger.Warnf("UpdateLastRead: %v", err)
 				}
 			}
 		}

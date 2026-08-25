@@ -2022,6 +2022,13 @@ func main() {
 			logger.Infof("✓ Connected to WhatsApp")
 		case *events.PairSuccess:
 			logger.Infof("✓ Paired successfully (device: %s)", v.ID.String())
+		case *events.Disconnected:
+			// whatsmeow's own auto-reconnect handles the common case, but it
+			// gives up silently on some stream errors and the process then sits
+			// alive-but-deaf forever (all three bridges did, 2026-08-24 22:20,
+			// noticed a day later). reconnectWatchdog is the backstop; this
+			// event only exists so the outage is visible in the logs.
+			logger.Warnf("Disconnected from WhatsApp — watchdog will redial")
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out (reason: %v). Restart bridge or wait for auto-reconnect.", v.Reason)
 		case *events.CallOffer:
@@ -2108,6 +2115,8 @@ func main() {
 		go qrPairingLoop(client, logger)
 	}
 
+	go reconnectWatchdog(client, logger)
+
 	fmt.Println("Bridge is running. Ctrl+C to exit.")
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
@@ -2115,6 +2124,29 @@ func main() {
 
 	fmt.Println("Disconnecting...")
 	client.Disconnect()
+}
+
+// reconnectWatchdog redials whenever the socket is down but the device is
+// still paired.
+//
+// whatsmeow auto-reconnects internally, but not from every failure: on
+// 2026-08-24 all three bridges dropped within 20 minutes of each other and
+// none came back. The process stayed up and /api/health kept answering, so
+// nothing looked broken while inbound messages silently stopped for a day.
+// Connect() is safe to call when already connected (returns
+// ErrAlreadyConnected), and is a no-op worth retrying otherwise.
+func reconnectWatchdog(client *whatsmeow.Client, logger waLog.Logger) {
+	const interval = 60 * time.Second
+	for {
+		time.Sleep(interval)
+		if client.Store.ID == nil || client.IsConnected() {
+			continue
+		}
+		logger.Warnf("watchdog: socket down, redialing")
+		if err := client.Connect(); err != nil && err != whatsmeow.ErrAlreadyConnected {
+			logger.Errorf("watchdog: reconnect failed: %v", err)
+		}
+	}
 }
 
 // sanitizePhone keeps only digits (strips +, spaces, dashes).

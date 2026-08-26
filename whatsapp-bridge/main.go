@@ -1291,14 +1291,21 @@ func respondStatusResult(w http.ResponseWriter, err error, okMsg string) {
 }
 
 // Extract direct path from a WhatsApp media URL
+// extractDirectPathFromURL turns a stored mmg.whatsapp.net URL back into the
+// directPath whatsmeow expects.
+//
+// The query string is part of the direct path and MUST be preserved: WhatsApp's
+// CDN auth lives in ?ccb=&oh=&oe=&_nc_sid=, and DownloadMediaWithPath builds
+// "https://" + host + directPath + "&hash=..." — it appends with &, assuming the
+// path already opened a query. Stripping at "?" produced a URL with no query at
+// all and every download 403'd (caught 2026-08-26; images and voice notes were
+// undownloadable while text kept flowing).
 func extractDirectPathFromURL(url string) string {
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
 		return url
 	}
-	pathPart := parts[1]
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-	return "/" + pathPart
+	return "/" + parts[1]
 }
 
 // startRESTServer exposes /api/send, /api/download, /api/health.

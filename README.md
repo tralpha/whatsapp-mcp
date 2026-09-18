@@ -159,6 +159,19 @@ You can send various media types to your WhatsApp contacts:
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
 
+#### Durable R2 media archive
+
+The Railway bridge can lazily archive decrypted media in a private Cloudflare R2 bucket. PostgreSQL continues to store messages and small archive metadata; media bytes stay in R2. On the first `/api/media` request, the bridge downloads from WhatsApp (requesting a phone re-upload when necessary), uploads the recovered bytes to R2, and records the private object key. Later requests read R2 first.
+
+Set all four variables to enable archival, or leave all four unset to retain the WhatsApp-only behavior:
+
+- `R2_ACCOUNT_ID`
+- `R2_BUCKET`
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
+
+The bucket must remain private. Scope the API token to object read/write access for that bucket only.
+
 ## Technical Details
 
 1. Claude sends requests to the Python MCP server

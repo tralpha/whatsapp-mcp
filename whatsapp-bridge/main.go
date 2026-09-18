@@ -107,6 +107,10 @@ func NewMessageStore(dsn string) (*MessageStore, error) {
 			file_length BIGINT,
 			PRIMARY KEY (id, chat_jid)
 		);
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS archive_key TEXT;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS archive_etag TEXT;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS archive_error TEXT;
 		CREATE TABLE IF NOT EXISTS calls (
 			call_id TEXT PRIMARY KEY,
 			from_jid TEXT NOT NULL,
@@ -1129,6 +1133,28 @@ func (store *MessageStore) GetMessageSource(id, chatJID string) (string, bool, e
 	return sender, isFromMe, err
 }
 
+func (store *MessageStore) GetArchiveKey(id, chatJID string) (string, error) {
+	var key sql.NullString
+	err := store.db.QueryRow(`SELECT archive_key FROM messages WHERE id = $1 AND chat_jid = $2`, id, chatJID).Scan(&key)
+	return key.String, err
+}
+
+func (store *MessageStore) StoreArchiveSuccess(id, chatJID, key, etag string) error {
+	_, err := store.db.Exec(
+		`UPDATE messages SET archive_key = $1, archive_etag = $2, archived_at = NOW(), archive_error = NULL WHERE id = $3 AND chat_jid = $4`,
+		key, etag, id, chatJID,
+	)
+	return err
+}
+
+func (store *MessageStore) StoreArchiveError(id, chatJID string, archiveErr error) error {
+	_, err := store.db.Exec(
+		`UPDATE messages SET archive_error = $1 WHERE id = $2 AND chat_jid = $3`,
+		archiveErr.Error(), id, chatJID,
+	)
+	return err
+}
+
 // Get media info from the database
 func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
 	var mediaType, filename, url string
@@ -1230,13 +1256,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 // fetchMediaBytes fetches + decrypts media for a message and returns it as raw bytes.
 // Streams cleanly through the HTTP handler — no filesystem intermediate.
-func fetchMediaBytes(client *whatsmeow.Client, messageStore *MessageStore, retryCoordinator *mediaRetryCoordinator, messageID, chatJID string) (mediaType, filename string, data []byte, err error) {
+func fetchMediaBytes(client *whatsmeow.Client, messageStore *MessageStore, retryCoordinator *mediaRetryCoordinator, archive mediaArchive, account, messageID, chatJID string) (mediaType, filename string, data []byte, err error) {
 	mt, fn, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, metaErr := messageStore.GetMediaInfo(messageID, chatJID)
 	if metaErr != nil {
 		return "", "", nil, fmt.Errorf("message not found: %w", metaErr)
 	}
 	if mt == "" {
 		return "", "", nil, fmt.Errorf("message is not a media message")
+	}
+	if archivedData, ok := loadArchivedMedia(context.Background(), archive, messageStore, messageID, chatJID); ok {
+		return mt, fn, archivedData, nil
 	}
 	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
 		return "", "", nil, fmt.Errorf("incomplete media metadata; cannot decrypt")
@@ -1266,6 +1295,7 @@ func fetchMediaBytes(client *whatsmeow.Client, messageStore *MessageStore, retry
 	if dlErr != nil {
 		return "", "", nil, fmt.Errorf("decrypt/download failed: %w", dlErr)
 	}
+	storeRecoveredMedia(context.Background(), archive, messageStore, account, messageID, chatJID, fn, mimeForMediaType(mt, fn), bytes)
 	return mt, fn, bytes, nil
 }
 
@@ -1373,7 +1403,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // startRESTServer exposes /api/send, /api/download, /api/health.
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retryCoordinator *mediaRetryCoordinator, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retryCoordinator *mediaRetryCoordinator, archive mediaArchive, account string, port int) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -1824,7 +1854,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			http.Error(w, "message_id and chat_jid required", http.StatusBadRequest)
 			return
 		}
-		mediaType, filename, data, err := fetchMediaBytes(client, messageStore, retryCoordinator, msgID, chatJID)
+		mediaType, filename, data, err := fetchMediaBytes(client, messageStore, retryCoordinator, archive, account, msgID, chatJID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -2083,6 +2113,16 @@ func main() {
 	}
 	defer messageStore.Close()
 	retryCoordinator := newMediaRetryCoordinator()
+	archive, err := newMediaArchiveFromEnv(context.Background())
+	if err != nil {
+		logger.Errorf("Failed to initialize R2 media archive: %v", err)
+		return
+	}
+	if archive == nil {
+		logger.Infof("R2 media archive disabled")
+	} else {
+		logger.Infof("R2 media archive enabled")
+	}
 
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -2168,7 +2208,7 @@ func main() {
 	})
 
 	// Start REST server up-front so /api/health responds during pairing.
-	startRESTServer(client, messageStore, retryCoordinator, port)
+	startRESTServer(client, messageStore, retryCoordinator, archive, account, port)
 
 	// whatsmeow has a strict rule: GetQRChannel must be called BEFORE Connect.
 	// So we split three code paths:

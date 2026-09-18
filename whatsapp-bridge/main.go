@@ -534,15 +534,15 @@ type SendMessageResponse struct {
 // SendMessageRequest represents the request body for the send message API.
 //
 // Three mutually exclusive (but pairwise-compatible) delivery modes:
-//   1. Text only             — Message is set, no media.
-//   2. Media from filesystem — MediaPath points at a file on the bridge
-//                              container; Message becomes the caption.
-//   3. Media from caller     — MediaBase64 is base64-encoded raw bytes,
-//                              Filename is the original filename (used as
-//                              DocumentMessage.FileName / Title so the
-//                              recipient sees the real name, not a UUID),
-//                              MimeType is optional (derived from filename
-//                              extension when empty). Message becomes caption.
+//  1. Text only             — Message is set, no media.
+//  2. Media from filesystem — MediaPath points at a file on the bridge
+//     container; Message becomes the caption.
+//  3. Media from caller     — MediaBase64 is base64-encoded raw bytes,
+//     Filename is the original filename (used as
+//     DocumentMessage.FileName / Title so the
+//     recipient sees the real name, not a UUID),
+//     MimeType is optional (derived from filename
+//     extension when empty). Message becomes caption.
 //
 // MediaBase64 takes priority over MediaPath if both are present.
 type SendMessageRequest struct {
@@ -598,17 +598,17 @@ type StatusReactRequest struct {
 
 // WebhookPayload is what we POST to WEBHOOK_URL on every incoming message.
 type WebhookPayload struct {
-	Account     string    `json:"account"`
-	MessageID   string    `json:"message_id"`
-	ChatJID     string    `json:"chat_jid"`
-	Sender      string    `json:"sender"`
-	SenderName  string    `json:"sender_name,omitempty"`
-	IsFromMe    bool      `json:"is_from_me"`
-	IsGroup     bool      `json:"is_group"`
-	Content     string    `json:"content"`
-	MediaType   string    `json:"media_type,omitempty"`
-	Filename    string    `json:"filename,omitempty"`
-	Timestamp   time.Time `json:"timestamp"`
+	Account    string    `json:"account"`
+	MessageID  string    `json:"message_id"`
+	ChatJID    string    `json:"chat_jid"`
+	Sender     string    `json:"sender"`
+	SenderName string    `json:"sender_name,omitempty"`
+	IsFromMe   bool      `json:"is_from_me"`
+	IsGroup    bool      `json:"is_group"`
+	Content    string    `json:"content"`
+	MediaType  string    `json:"media_type,omitempty"`
+	Filename   string    `json:"filename,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 // maxMediaBytes caps accepted media payload size to protect the bridge from
@@ -1114,6 +1114,21 @@ func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fil
 	return err
 }
 
+func (store *MessageStore) UpdateMediaURL(id, chatJID, url string) error {
+	_, err := store.db.Exec(`UPDATE messages SET url = $1 WHERE id = $2 AND chat_jid = $3`, url, id, chatJID)
+	return err
+}
+
+func (store *MessageStore) GetMessageSource(id, chatJID string) (string, bool, error) {
+	var sender string
+	var isFromMe bool
+	err := store.db.QueryRow(
+		`SELECT sender, is_from_me FROM messages WHERE id = $1 AND chat_jid = $2`,
+		id, chatJID,
+	).Scan(&sender, &isFromMe)
+	return sender, isFromMe, err
+}
+
 // Get media info from the database
 func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
 	var mediaType, filename, url string
@@ -1215,7 +1230,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 // fetchMediaBytes fetches + decrypts media for a message and returns it as raw bytes.
 // Streams cleanly through the HTTP handler — no filesystem intermediate.
-func fetchMediaBytes(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (mediaType, filename string, data []byte, err error) {
+func fetchMediaBytes(client *whatsmeow.Client, messageStore *MessageStore, retryCoordinator *mediaRetryCoordinator, messageID, chatJID string) (mediaType, filename string, data []byte, err error) {
 	mt, fn, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, metaErr := messageStore.GetMediaInfo(messageID, chatJID)
 	if metaErr != nil {
 		return "", "", nil, fmt.Errorf("message not found: %w", metaErr)
@@ -1245,10 +1260,59 @@ func fetchMediaBytes(client *whatsmeow.Client, messageStore *MessageStore, messa
 		MediaType: wt,
 	}
 	bytes, dlErr := client.Download(context.Background(), downloader)
+	if dlErr != nil && retryCoordinator != nil && shouldRetryMediaDownload(dlErr) {
+		bytes, dlErr = retryExpiredMedia(client, messageStore, retryCoordinator, messageID, chatJID, mediaKey, downloader)
+	}
 	if dlErr != nil {
 		return "", "", nil, fmt.Errorf("decrypt/download failed: %w", dlErr)
 	}
 	return mt, fn, bytes, nil
+}
+
+func retryExpiredMedia(client *whatsmeow.Client, messageStore *MessageStore, coordinator *mediaRetryCoordinator, messageID, chatJID string, mediaKey []byte, downloader *MediaDownloader) ([]byte, error) {
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("parse media chat JID: %w", err)
+	}
+	sender, isFromMe, err := messageStore.GetMessageSource(messageID, chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("load media message source: %w", err)
+	}
+	senderJID := chat
+	if strings.Contains(sender, "@") {
+		if parsed, parseErr := types.ParseJID(sender); parseErr == nil {
+			senderJID = parsed
+		}
+	}
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat: chat, Sender: senderJID, IsFromMe: isFromMe, IsGroup: chat.Server == types.GroupServer,
+		},
+		ID: types.MessageID(messageID),
+	}
+	pending, leader := coordinator.begin(info.ID, mediaKey)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if leader {
+		if err := client.SendMediaRetryReceipt(ctx, info, mediaKey); err != nil {
+			coordinator.mu.Lock()
+			if coordinator.pending[info.ID] == pending {
+				delete(coordinator.pending, info.ID)
+			}
+			coordinator.mu.Unlock()
+			return nil, fmt.Errorf("request media re-upload: %w", err)
+		}
+	}
+	directPath, err := coordinator.wait(ctx, info.ID, pending)
+	if err != nil {
+		return nil, fmt.Errorf("wait for media re-upload: %w", err)
+	}
+	downloader.URL = ""
+	downloader.DirectPath = directPath
+	if err := messageStore.UpdateMediaURL(messageID, chatJID, directPath); err != nil {
+		return nil, fmt.Errorf("persist refreshed media path: %w", err)
+	}
+	return client.Download(context.Background(), downloader)
 }
 
 // mimeForMediaType maps whatsmeow media types to reasonable Content-Type defaults.
@@ -1309,7 +1373,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // startRESTServer exposes /api/send, /api/download, /api/health.
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retryCoordinator *mediaRetryCoordinator, port int) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -1760,7 +1824,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			http.Error(w, "message_id and chat_jid required", http.StatusBadRequest)
 			return
 		}
-		mediaType, filename, data, err := fetchMediaBytes(client, messageStore, msgID, chatJID)
+		mediaType, filename, data, err := fetchMediaBytes(client, messageStore, retryCoordinator, msgID, chatJID)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -2018,6 +2082,7 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+	retryCoordinator := newMediaRetryCoordinator()
 
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -2025,6 +2090,10 @@ func main() {
 			handleMessage(client, messageStore, v, logger, account, webhookURL, webhookSecret)
 		case *events.HistorySync:
 			handleHistorySync(client, messageStore, v, logger)
+		case *events.MediaRetry:
+			if !retryCoordinator.deliver(v) {
+				logger.Warnf("Received media retry response with no pending request: %s", v.MessageID)
+			}
 		case *events.Connected:
 			logger.Infof("✓ Connected to WhatsApp")
 		case *events.PairSuccess:
@@ -2099,7 +2168,7 @@ func main() {
 	})
 
 	// Start REST server up-front so /api/health responds during pairing.
-	startRESTServer(client, messageStore, port)
+	startRESTServer(client, messageStore, retryCoordinator, port)
 
 	// whatsmeow has a strict rule: GetQRChannel must be called BEFORE Connect.
 	// So we split three code paths:

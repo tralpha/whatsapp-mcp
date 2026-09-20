@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,6 +29,7 @@ import (
 	"github.com/mdp/qrterminal"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -223,6 +225,20 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 		messages = append(messages, msg)
 	}
 	return messages, nil
+}
+
+
+// GetLatestMessageAnchor returns the newest message in a chat with the fields
+// BuildHistorySyncRequest needs. Empty id means the chat has no rows yet.
+func (store *MessageStore) GetLatestMessageAnchor(chatJID string) (id string, isFromMe bool, ts time.Time, err error) {
+	err = store.db.QueryRow(
+		`SELECT id, is_from_me, timestamp FROM messages WHERE chat_jid = $1 ORDER BY timestamp DESC LIMIT 1`,
+		chatJID,
+	).Scan(&id, &isFromMe, &ts)
+	if err == sql.ErrNoRows {
+		return "", false, time.Time{}, nil
+	}
+	return id, isFromMe, ts, err
 }
 
 // Get all chats
@@ -2104,6 +2120,13 @@ func main() {
 		}
 	}
 
+	// Ask the phone to honour on-demand history sync (needed for backfill of
+	// messages sent from the phone that this companion never saw live).
+	if store.DeviceProps != nil && store.DeviceProps.HistorySyncConfig != nil {
+		store.DeviceProps.HistorySyncConfig.OnDemandReady = proto.Bool(true)
+		store.DeviceProps.HistorySyncConfig.CompleteOnDemandReady = proto.Bool(true)
+	}
+
 	client := whatsmeow.NewClient(deviceStore, logger)
 	if client == nil {
 		logger.Errorf("Failed to create WhatsApp client")
@@ -2140,6 +2163,20 @@ func main() {
 			}
 		case *events.Connected:
 			logger.Infof("✓ Connected to WhatsApp")
+			// Advertise available so the phone fans out our own sends to this companion.
+			if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+				logger.Warnf("SendPresence(available): %v", err)
+			}
+		case *events.OfflineSyncCompleted:
+			logger.Infof("Offline sync completed — requesting phone history backfill for recent chats")
+			go requestRecentHistoryBackfill(client, messageStore, logger)
+		case *events.UndecryptableMessage:
+			// Phone-originated IsFromMe copies can arrive undecryptable/unavailable on
+			// companions. Log the gap; whatsmeow already requests a retry.
+			if v.Info.IsFromMe {
+				logger.Warnf("Undecryptable own message id=%s chat=%s unavailable=%v type=%v",
+					v.Info.ID, v.Info.Chat, v.IsUnavailable, v.UnavailableType)
+			}
 		case *events.PairSuccess:
 			logger.Infof("✓ Paired successfully (device: %s)", v.ID.String())
 		case *events.Disconnected:
@@ -2431,6 +2468,62 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		}
 	}
 	return name
+}
+
+
+// requestRecentHistoryBackfill asks the phone for recent history on the most
+// active DM chats. Companion devices sometimes stop receiving live IsFromMe
+// copies of messages sent from the phone; on-demand history still recovers
+// those rows when the phone is online. Best-effort and rate-limited.
+func requestRecentHistoryBackfill(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	if client == nil || messageStore == nil || !client.IsConnected() {
+		return
+	}
+	chats, err := messageStore.GetChats()
+	if err != nil {
+		logger.Warnf("history backfill: list chats: %v", err)
+		return
+	}
+	type chatTS struct {
+		jid string
+		ts  time.Time
+	}
+	ranked := make([]chatTS, 0, len(chats))
+	for jid, ts := range chats {
+		if jid == "" || jid == "status@broadcast" || strings.HasSuffix(jid, "@g.us") {
+			continue
+		}
+		ranked = append(ranked, chatTS{jid: jid, ts: ts})
+	}
+	sort.Slice(ranked, func(i, j int) bool { return ranked[i].ts.After(ranked[j].ts) })
+	const maxChats = 25
+	if len(ranked) > maxChats {
+		ranked = ranked[:maxChats]
+	}
+	requested := 0
+	for _, c := range ranked {
+		id, isFromMe, msgTS, err := messageStore.GetLatestMessageAnchor(c.jid)
+		if err != nil || id == "" {
+			continue
+		}
+		chatJID, err := types.ParseJID(c.jid)
+		if err != nil {
+			continue
+		}
+		info := &types.MessageInfo{
+			MessageSource: types.MessageSource{Chat: chatJID, IsFromMe: isFromMe},
+			ID:            id,
+			Timestamp:     msgTS,
+		}
+		msg := client.BuildHistorySyncRequest(info, 50)
+		if _, err := client.SendPeerMessage(context.Background(), msg); err != nil {
+			logger.Warnf("history backfill %s: %v", c.jid, err)
+			continue
+		}
+		requested++
+		time.Sleep(400 * time.Millisecond)
+	}
+	logger.Infof("Requested on-demand history backfill for %d chats", requested)
 }
 
 // Handle history sync events

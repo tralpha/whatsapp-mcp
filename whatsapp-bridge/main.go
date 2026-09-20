@@ -1805,6 +1805,53 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 	// /api/unread — genuinely unread messages per 1:1 chat (groups and status
 	// excluded), computed against last_read_at synced from read receipts on
 	// any of the user's linked devices, not an arbitrary query-time cutoff.
+
+	// /api/history-backfill?max=100&offset=0&count=100 — ask the phone for
+	// on-demand history on a window of DM chats (for recovering missing
+	// from_me / outbound rows). Runs async; returns how many requests were queued.
+	mux.HandleFunc("/api/history-backfill", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		maxChats := 100
+		offset := 0
+		msgCount := 100
+		if v := r.URL.Query().Get("max"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				maxChats = n
+			}
+		}
+		if v := r.URL.Query().Get("offset"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				offset = n
+			}
+		}
+		if v := r.URL.Query().Get("count"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				msgCount = n
+			}
+		}
+		if !client.IsConnected() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "not connected"})
+			return
+		}
+		go func() {
+			n := requestRecentHistoryBackfill(client, messageStore, client.Log, maxChats, offset, msgCount)
+			client.Log.Infof("history-backfill endpoint finished: requested=%d", n)
+		}()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":     true,
+			"queued": true,
+			"max":    maxChats,
+			"offset": offset,
+			"count":  msgCount,
+		})
+	})
+
 	mux.HandleFunc("/api/unread", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2169,7 +2216,7 @@ func main() {
 			}
 		case *events.OfflineSyncCompleted:
 			logger.Infof("Offline sync completed — requesting phone history backfill for recent chats")
-			go requestRecentHistoryBackfill(client, messageStore, logger)
+			go requestRecentHistoryBackfill(client, messageStore, logger, 100, 0, 100)
 		case *events.UndecryptableMessage:
 			// Phone-originated IsFromMe copies can arrive undecryptable/unavailable on
 			// companions. Log the gap; whatsmeow already requests a retry.
@@ -2471,18 +2518,34 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 }
 
 
-// requestRecentHistoryBackfill asks the phone for recent history on the most
-// active DM chats. Companion devices sometimes stop receiving live IsFromMe
-// copies of messages sent from the phone; on-demand history still recovers
-// those rows when the phone is online. Best-effort and rate-limited.
-func requestRecentHistoryBackfill(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+// requestRecentHistoryBackfill asks the phone for recent history on DM chats.
+// Companion devices sometimes stop receiving live IsFromMe copies of messages
+// sent from the phone; on-demand history still recovers those rows when the
+// phone is online. Best-effort and rate-limited.
+//
+// maxChats/offset select a window of chats ordered by last_message_time DESC.
+// msgCount is how many messages before the latest anchor to request (WhatsApp
+// typically caps around 50–100).
+func requestRecentHistoryBackfill(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger, maxChats, offset, msgCount int) int {
 	if client == nil || messageStore == nil || !client.IsConnected() {
-		return
+		return 0
+	}
+	if maxChats <= 0 {
+		maxChats = 25
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if msgCount <= 0 {
+		msgCount = 50
+	}
+	if msgCount > 100 {
+		msgCount = 100
 	}
 	chats, err := messageStore.GetChats()
 	if err != nil {
 		logger.Warnf("history backfill: list chats: %v", err)
-		return
+		return 0
 	}
 	type chatTS struct {
 		jid string
@@ -2496,7 +2559,11 @@ func requestRecentHistoryBackfill(client *whatsmeow.Client, messageStore *Messag
 		ranked = append(ranked, chatTS{jid: jid, ts: ts})
 	}
 	sort.Slice(ranked, func(i, j int) bool { return ranked[i].ts.After(ranked[j].ts) })
-	const maxChats = 25
+	if offset >= len(ranked) {
+		logger.Infof("history backfill: offset %d past end (%d chats)", offset, len(ranked))
+		return 0
+	}
+	ranked = ranked[offset:]
 	if len(ranked) > maxChats {
 		ranked = ranked[:maxChats]
 	}
@@ -2515,15 +2582,16 @@ func requestRecentHistoryBackfill(client *whatsmeow.Client, messageStore *Messag
 			ID:            id,
 			Timestamp:     msgTS,
 		}
-		msg := client.BuildHistorySyncRequest(info, 50)
+		msg := client.BuildHistorySyncRequest(info, msgCount)
 		if _, err := client.SendPeerMessage(context.Background(), msg); err != nil {
 			logger.Warnf("history backfill %s: %v", c.jid, err)
 			continue
 		}
 		requested++
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
-	logger.Infof("Requested on-demand history backfill for %d chats", requested)
+	logger.Infof("Requested on-demand history backfill for %d chats (offset=%d max=%d count=%d)", requested, offset, maxChats, msgCount)
+	return requested
 }
 
 // Handle history sync events

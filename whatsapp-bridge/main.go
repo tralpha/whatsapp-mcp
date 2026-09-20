@@ -1599,6 +1599,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error sending status reply: %v", err)})
 			return
 		}
+		// whatsmeow does not echo our own sends; mirror /api/send and persist.
+		persistOutbound(client, messageStore, resp.ID, dmJID, req.Message, "", "")
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Status reply sent", MessageID: resp.ID})
 	})
 
@@ -1667,6 +1669,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error sending reply: %v", err)})
 			return
 		}
+		// whatsmeow does not echo our own sends; mirror /api/send and persist.
+		persistOutbound(client, messageStore, resp.ID, chatJID, req.Message, "", "")
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Reply sent", MessageID: resp.ID})
 	})
 

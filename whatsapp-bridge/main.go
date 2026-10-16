@@ -116,6 +116,9 @@ func NewMessageStore(dsn string) (*MessageStore, error) {
 		ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
 		ALTER TABLE messages ADD COLUMN IF NOT EXISTS original_content TEXT;
 		ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS quoted_message_id TEXT;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS quoted_sender TEXT;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS quoted_text TEXT;
 		CREATE TABLE IF NOT EXISTS calls (
 			call_id TEXT PRIMARY KEY,
 			from_jid TEXT NOT NULL,
@@ -202,6 +205,68 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
+}
+
+// SetQuote records which earlier message a reply quotes (WhatsApp's swipe-to-
+// reply). quoted_text prefers the snippet carried in the reply itself and falls
+// back to our own copy of the quoted row, so a reply to a media message or to a
+// message whose snippet WhatsApp trimmed still reads as "replying to X".
+func (store *MessageStore) SetQuote(id, chatJID string, q quote) error {
+	if q.ID == "" {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`UPDATE messages SET quoted_message_id = $3, quoted_sender = $4,
+		 quoted_text = COALESCE(NULLIF($5, ''),
+		   (SELECT COALESCE(NULLIF(q.content, ''), '[' || q.media_type || ']')
+		    FROM messages q WHERE q.id = $3 AND q.chat_jid = $2))
+		 WHERE id = $1 AND chat_jid = $2`,
+		id, chatJID, q.ID, q.Sender, q.Text)
+	return err
+}
+
+// quote is the reply-to pointer carried in a message's ContextInfo.
+type quote struct {
+	ID     string `json:"quoted_message_id,omitempty"`
+	Sender string `json:"quoted_sender,omitempty"`
+	Text   string `json:"quoted_text,omitempty"`
+}
+
+// extractQuote returns the message this one replies to, if any. ContextInfo
+// lives on each content type separately, so check every type a guest can
+// reply with (text, captioned media, voice note, sticker).
+func extractQuote(msg *waProto.Message) quote {
+	if msg == nil {
+		return quote{}
+	}
+	var ci *waProto.ContextInfo
+	switch {
+	case msg.GetExtendedTextMessage() != nil:
+		ci = msg.GetExtendedTextMessage().GetContextInfo()
+	case msg.GetImageMessage() != nil:
+		ci = msg.GetImageMessage().GetContextInfo()
+	case msg.GetVideoMessage() != nil:
+		ci = msg.GetVideoMessage().GetContextInfo()
+	case msg.GetAudioMessage() != nil:
+		ci = msg.GetAudioMessage().GetContextInfo()
+	case msg.GetDocumentMessage() != nil:
+		ci = msg.GetDocumentMessage().GetContextInfo()
+	case msg.GetStickerMessage() != nil:
+		ci = msg.GetStickerMessage().GetContextInfo()
+	}
+	if ci.GetStanzaID() == "" {
+		return quote{}
+	}
+	qm := ci.GetQuotedMessage()
+	text := extractTextContent(qm)
+	if text == "" {
+		text = qm.GetImageMessage().GetCaption() + qm.GetVideoMessage().GetCaption() + qm.GetDocumentMessage().GetCaption()
+	}
+	sender := ci.GetParticipant()
+	if i := strings.IndexByte(sender, '@'); i >= 0 {
+		sender = sender[:i] // match messages.sender, which stores the bare user
+	}
+	return quote{ID: ci.GetStanzaID(), Sender: sender, Text: text}
 }
 
 // ApplyEdit records an edit: content becomes the new text and the first
@@ -698,6 +763,7 @@ type WebhookPayload struct {
 	MediaType  string    `json:"media_type,omitempty"`
 	Filename   string    `json:"filename,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
+	quote                // set when this message replies to an earlier one
 }
 
 // maxMediaBytes caps accepted media payload size to protect the bridge from
@@ -1171,6 +1237,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	); err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 	}
+	q := extractQuote(msg.Message)
+	if err := messageStore.SetQuote(msg.Info.ID, chatJID, q); err != nil {
+		logger.Warnf("SetQuote %s: %v", msg.Info.ID, err)
+	}
 
 	timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
 	direction := "←"
@@ -1181,6 +1251,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
 	} else if content != "" {
 		fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+	}
+	if q.ID != "" {
+		fmt.Printf("    ↪ replying to %s: %s\n", q.ID, q.Text)
 	}
 
 	// Fire webhook for inbound messages only (don't echo our own sends).
@@ -1197,6 +1270,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			MediaType:  mediaType,
 			Filename:   filename,
 			Timestamp:  msg.Info.Timestamp,
+			quote:      q,
 		}, webhookURL, webhookSecret)
 	}
 }
@@ -1778,6 +1852,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 		}
 		// whatsmeow does not echo our own sends; mirror /api/send and persist.
 		persistOutbound(client, messageStore, resp.ID, chatJID, req.Message, "", "")
+		if err := messageStore.SetQuote(resp.ID, chatJID.String(), quote{ID: req.MessageID, Sender: senderJID.User, Text: req.QuotedText}); err != nil {
+			fmt.Printf("[reply] persist quote %s failed: %v\n", resp.ID, err)
+		}
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Reply sent", MessageID: resp.ID})
 	})
 
@@ -2890,6 +2967,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			if err := messageStore.StoreMessage(msgID, chatJID, sender, content, ts, isFromMe,
 				mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength); err == nil {
 				syncedCount++
+				_ = messageStore.SetQuote(msgID, chatJID, extractQuote(msg.Message.GetMessage()))
 			}
 		}
 	}

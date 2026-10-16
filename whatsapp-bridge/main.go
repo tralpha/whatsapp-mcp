@@ -206,21 +206,27 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 // ApplyEdit records an edit: content becomes the new text and the first
 // pre-edit text is kept in original_content, so a draft-vs-sent diff survives
-// any number of edits.
-func (store *MessageStore) ApplyEdit(id, chatJID, content string, at time.Time) error {
+// any number of edits. Ownership is enforced in the WHERE: only the original
+// author (fromMe, or the same sender) can rewrite a row, so a group participant
+// can't forge an edit against someone else's message id.
+func (store *MessageStore) ApplyEdit(id, chatJID, content string, at time.Time, fromMe bool, sender string) error {
 	_, err := store.db.Exec(
 		`UPDATE messages SET original_content = COALESCE(original_content, content),
-		 content = $3, edited_at = $4 WHERE id = $1 AND chat_jid = $2`,
-		id, chatJID, content, at)
+		 content = $3, edited_at = $4
+		 WHERE id = $1 AND chat_jid = $2 AND is_from_me = $5 AND (is_from_me OR sender = $6)`,
+		id, chatJID, content, at, fromMe, sender)
 	return err
 }
 
 // MarkDeleted flags a revoked ("deleted for everyone") message. The row and its
 // content are kept: the WhatsApp clients hide it, our log stays an audit trail.
-func (store *MessageStore) MarkDeleted(id, chatJID string, at time.Time) error {
+// Same ownership guard as ApplyEdit; asAdmin skips it for a revoke we sent
+// ourselves as group admin. Inbound admin revokes in groups are not logged.
+func (store *MessageStore) MarkDeleted(id, chatJID string, at time.Time, fromMe bool, sender string, asAdmin bool) error {
 	_, err := store.db.Exec(
-		`UPDATE messages SET deleted_at = $3 WHERE id = $1 AND chat_jid = $2`,
-		id, chatJID, at)
+		`UPDATE messages SET deleted_at = $3
+		 WHERE id = $1 AND chat_jid = $2 AND ($6 OR (is_from_me = $4 AND (is_from_me OR sender = $5)))`,
+		id, chatJID, at, fromMe, sender, asAdmin)
 	return err
 }
 
@@ -1139,12 +1145,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		switch pm.GetType() {
 		case waProto.ProtocolMessage_MESSAGE_EDIT:
 			newText := extractTextContent(pm.GetEditedMessage())
-			if err := messageStore.ApplyEdit(target, chatJID, newText, msg.Info.Timestamp); err != nil {
+			if err := messageStore.ApplyEdit(target, chatJID, newText, msg.Info.Timestamp, msg.Info.IsFromMe, sender); err != nil {
 				logger.Warnf("ApplyEdit %s: %v", target, err)
 			}
 			fmt.Printf("[%s] ✏️ %s edited %s: %s\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), sender, target, newText)
 		case waProto.ProtocolMessage_REVOKE:
-			if err := messageStore.MarkDeleted(target, chatJID, msg.Info.Timestamp); err != nil {
+			if err := messageStore.MarkDeleted(target, chatJID, msg.Info.Timestamp, msg.Info.IsFromMe, sender, false); err != nil {
 				logger.Warnf("MarkDeleted %s: %v", target, err)
 			}
 			fmt.Printf("[%s] 🗑️ %s deleted %s\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), sender, target)
@@ -1827,7 +1833,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error sending edit: %v", err)})
 			return
 		}
-		if err := messageStore.ApplyEdit(req.MessageID, chatJID.String(), req.Message, time.Now()); err != nil {
+		if err := messageStore.ApplyEdit(req.MessageID, chatJID.String(), req.Message, time.Now(), true, ""); err != nil {
 			fmt.Printf("[edit] persist %s failed: %v\n", req.MessageID, err)
 		}
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Message edited", MessageID: resp.ID})
@@ -1893,7 +1899,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error deleting message: %v", err)})
 			return
 		}
-		if err := messageStore.MarkDeleted(req.MessageID, chatJID.String(), time.Now()); err != nil {
+		if err := messageStore.MarkDeleted(req.MessageID, chatJID.String(), time.Now(), true, "", req.Sender != ""); err != nil {
 			fmt.Printf("[delete] persist %s failed: %v\n", req.MessageID, err)
 		}
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Message deleted", MessageID: resp.ID})

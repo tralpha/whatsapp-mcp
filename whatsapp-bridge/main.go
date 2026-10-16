@@ -208,21 +208,29 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 }
 
 // SetQuote records which earlier message a reply quotes (WhatsApp's swipe-to-
-// reply). quoted_text prefers the snippet carried in the reply itself and falls
-// back to our own copy of the quoted row, so a reply to a media message or to a
-// message whose snippet WhatsApp trimmed still reads as "replying to X".
-func (store *MessageStore) SetQuote(id, chatJID string, q quote) error {
+// reply) and returns the quote as stored. Our own copy of the quoted row wins
+// over the snippet carried in the reply: the snippet is sender-controlled, so a
+// guest could otherwise "quote" a hotel message that was never sent and the
+// drafter would trust it. The snippet is only the fallback for rows we never
+// stored (before the bridge existed, or a missed history sync).
+func (store *MessageStore) SetQuote(id, chatJID string, q quote) (quote, error) {
 	if q.ID == "" {
-		return nil
+		return q, nil
 	}
-	_, err := store.db.Exec(
-		`UPDATE messages SET quoted_message_id = $3, quoted_sender = $4,
-		 quoted_text = COALESCE(NULLIF($5, ''),
-		   (SELECT COALESCE(NULLIF(q.content, ''), '[' || q.media_type || ']')
-		    FROM messages q WHERE q.id = $3 AND q.chat_jid = $2))
-		 WHERE id = $1 AND chat_jid = $2`,
-		id, chatJID, q.ID, q.Sender, q.Text)
-	return err
+	err := store.db.QueryRow(
+		`WITH orig AS (
+		   SELECT COALESCE(NULLIF(content, ''), '[' || media_type || ']') AS text, sender
+		   FROM messages WHERE id = $3 AND chat_jid = $2)
+		 UPDATE messages SET quoted_message_id = $3,
+		   quoted_sender = COALESCE((SELECT sender FROM orig), NULLIF($4, '')),
+		   quoted_text = COALESCE((SELECT text FROM orig), NULLIF($5, ''))
+		 WHERE id = $1 AND chat_jid = $2
+		 RETURNING COALESCE(quoted_sender, ''), COALESCE(quoted_text, '')`,
+		id, chatJID, q.ID, q.Sender, q.Text).Scan(&q.Sender, &q.Text)
+	if err == sql.ErrNoRows {
+		return q, nil // reply row itself not stored (e.g. empty content)
+	}
+	return q, err
 }
 
 // quote is the reply-to pointer carried in a message's ContextInfo.
@@ -1237,8 +1245,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	); err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 	}
-	q := extractQuote(msg.Message)
-	if err := messageStore.SetQuote(msg.Info.ID, chatJID, q); err != nil {
+	q, err := messageStore.SetQuote(msg.Info.ID, chatJID, extractQuote(msg.Message))
+	if err != nil {
 		logger.Warnf("SetQuote %s: %v", msg.Info.ID, err)
 	}
 
@@ -1852,7 +1860,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 		}
 		// whatsmeow does not echo our own sends; mirror /api/send and persist.
 		persistOutbound(client, messageStore, resp.ID, chatJID, req.Message, "", "")
-		if err := messageStore.SetQuote(resp.ID, chatJID.String(), quote{ID: req.MessageID, Sender: senderJID.User, Text: req.QuotedText}); err != nil {
+		if _, err := messageStore.SetQuote(resp.ID, chatJID.String(), quote{ID: req.MessageID, Sender: senderJID.User, Text: req.QuotedText}); err != nil {
 			fmt.Printf("[reply] persist quote %s failed: %v\n", resp.ID, err)
 		}
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Reply sent", MessageID: resp.ID})
@@ -2967,7 +2975,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			if err := messageStore.StoreMessage(msgID, chatJID, sender, content, ts, isFromMe,
 				mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength); err == nil {
 				syncedCount++
-				_ = messageStore.SetQuote(msgID, chatJID, extractQuote(msg.Message.GetMessage()))
+				_, _ = messageStore.SetQuote(msgID, chatJID, extractQuote(msg.Message.GetMessage()))
 			}
 		}
 	}

@@ -113,6 +113,9 @@ func NewMessageStore(dsn string) (*MessageStore, error) {
 		ALTER TABLE messages ADD COLUMN IF NOT EXISTS archive_etag TEXT;
 		ALTER TABLE messages ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
 		ALTER TABLE messages ADD COLUMN IF NOT EXISTS archive_error TEXT;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS original_content TEXT;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 		CREATE TABLE IF NOT EXISTS calls (
 			call_id TEXT PRIMARY KEY,
 			from_jid TEXT NOT NULL,
@@ -199,6 +202,41 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
+}
+
+// ApplyEdit records an edit: content becomes the new text and the first
+// pre-edit text is kept in original_content, so a draft-vs-sent diff survives
+// any number of edits.
+func (store *MessageStore) ApplyEdit(id, chatJID, content string, at time.Time) error {
+	_, err := store.db.Exec(
+		`UPDATE messages SET original_content = COALESCE(original_content, content),
+		 content = $3, edited_at = $4 WHERE id = $1 AND chat_jid = $2`,
+		id, chatJID, content, at)
+	return err
+}
+
+// MarkDeleted flags a revoked ("deleted for everyone") message. The row and its
+// content are kept: the WhatsApp clients hide it, our log stays an audit trail.
+func (store *MessageStore) MarkDeleted(id, chatJID string, at time.Time) error {
+	_, err := store.db.Exec(
+		`UPDATE messages SET deleted_at = $3 WHERE id = $1 AND chat_jid = $2`,
+		id, chatJID, at)
+	return err
+}
+
+// GetMessageMeta returns what /api/edit and /api/delete need to refuse an
+// edit/delete WhatsApp would silently ignore. found=false means the bridge never
+// persisted the row (e.g. sent from the phone before a backfill); callers then
+// skip the pre-checks rather than block.
+func (store *MessageStore) GetMessageMeta(id, chatJID string) (isFromMe bool, ts time.Time, mediaType string, found bool, err error) {
+	var mt sql.NullString
+	err = store.db.QueryRow(
+		`SELECT is_from_me, timestamp, media_type FROM messages WHERE id = $1 AND chat_jid = $2`,
+		id, chatJID).Scan(&isFromMe, &ts, &mt)
+	if err == sql.ErrNoRows {
+		return false, time.Time{}, "", false, nil
+	}
+	return isFromMe, ts, mt.String, err == nil, err
 }
 
 // Get messages from a chat
@@ -606,6 +644,31 @@ type ReplyRequest struct {
 	QuotedText string `json:"quoted_text"` // text of the quoted message (best-effort context, may be empty)
 	Message    string `json:"message"`     // the reply text
 }
+
+// EditRequest is the body for /api/edit. Only our own text messages can be
+// edited, and only within WhatsApp's 15 minute window.
+type EditRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+	Message   string `json:"message"` // the new text
+}
+
+// DeleteRequest is the body for /api/delete ("delete for everyone"). Sender is
+// optional: empty means our own message; a group admin deleting someone else's
+// message passes that participant's JID.
+type DeleteRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+	Sender    string `json:"sender,omitempty"`
+}
+
+// WhatsApp's windows. Past them the server still accepts the protocol message
+// but recipients' clients ignore it, so the send "succeeds" and nothing changes.
+// We refuse up front instead of reporting a phantom success.
+const (
+	editWindow   = 15 * time.Minute
+	deleteWindow = 60 * time.Hour
+)
 
 // StatusReactRequest is the body for /api/status-react. Reacting to a status is
 // a normal reaction whose target key lives in status@broadcast: chat is the
@@ -1063,6 +1126,28 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] ⭐ %s cleared reaction on status %s\n", timestamp, sender, statusMessageID)
 		} else {
 			fmt.Printf("[%s] ⭐ %s reacted %s to status %s\n", timestamp, sender, reactionEmoji, statusMessageID)
+		}
+		return
+	}
+
+	// Edits and deletes (from the guest, or from our own phone) arrive as a
+	// ProtocolMessage pointing at the original message id. whatsmeow's UnwrapRaw
+	// already peeled the EditedMessage wrapper (msg.IsEdit). Without this branch
+	// they hit the empty-content guard below and our log keeps the stale text.
+	if pm := msg.Message.GetProtocolMessage(); pm != nil {
+		target := pm.GetKey().GetID()
+		switch pm.GetType() {
+		case waProto.ProtocolMessage_MESSAGE_EDIT:
+			newText := extractTextContent(pm.GetEditedMessage())
+			if err := messageStore.ApplyEdit(target, chatJID, newText, msg.Info.Timestamp); err != nil {
+				logger.Warnf("ApplyEdit %s: %v", target, err)
+			}
+			fmt.Printf("[%s] ✏️ %s edited %s: %s\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), sender, target, newText)
+		case waProto.ProtocolMessage_REVOKE:
+			if err := messageStore.MarkDeleted(target, chatJID, msg.Info.Timestamp); err != nil {
+				logger.Warnf("MarkDeleted %s: %v", target, err)
+			}
+			fmt.Printf("[%s] 🗑️ %s deleted %s\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), sender, target)
 		}
 		return
 	}
@@ -1688,6 +1773,130 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 		// whatsmeow does not echo our own sends; mirror /api/send and persist.
 		persistOutbound(client, messageStore, resp.ID, chatJID, req.Message, "", "")
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Reply sent", MessageID: resp.ID})
+	})
+
+	// /api/edit — edit one of our own text messages ("Edit" in the app).
+	// Same success/message_id shape as /api/send; message_id is the edit
+	// stanza's id, the original message keeps its id.
+	mux.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req EditRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" || req.Message == "" {
+			http.Error(w, "chat_jid, message_id, and message are required", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing chat_jid: %v", err), http.StatusBadRequest)
+			return
+		}
+		isFromMe, ts, mediaType, found, err := messageStore.GetMessageMeta(req.MessageID, chatJID.String())
+		if err != nil {
+			respondStatusResult(w, fmt.Errorf("lookup message: %w", err), "")
+			return
+		}
+		if found {
+			switch {
+			case !isFromMe:
+				http.Error(w, "can only edit our own messages", http.StatusBadRequest)
+				return
+			case mediaType != "":
+				http.Error(w, "only text messages can be edited", http.StatusBadRequest)
+				return
+			case time.Since(ts) > editWindow:
+				http.Error(w, fmt.Sprintf("edit window closed: message is %s old (WhatsApp allows %s)", time.Since(ts).Round(time.Minute), editWindow), http.StatusConflict)
+				return
+			}
+		}
+		if !client.IsConnected() {
+			respondStatusResult(w, fmt.Errorf("not connected to WhatsApp"), "")
+			return
+		}
+		edit := client.BuildEdit(chatJID, req.MessageID, &waProto.Message{Conversation: proto.String(req.Message)})
+		resp, err := client.SendMessage(context.Background(), chatJID, edit)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error sending edit: %v", err)})
+			return
+		}
+		if err := messageStore.ApplyEdit(req.MessageID, chatJID.String(), req.Message, time.Now()); err != nil {
+			fmt.Printf("[edit] persist %s failed: %v\n", req.MessageID, err)
+		}
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Message edited", MessageID: resp.ID})
+	})
+
+	// /api/delete — "delete for everyone". Own messages by default; a group
+	// admin can pass sender to delete someone else's. The row stays in our DB
+	// with deleted_at set.
+	mux.HandleFunc("/api/delete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req DeleteRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing chat_jid: %v", err), http.StatusBadRequest)
+			return
+		}
+		senderJID := types.EmptyJID // own message
+		if req.Sender != "" {
+			if strings.Contains(req.Sender, "@") {
+				senderJID, err = types.ParseJID(req.Sender)
+				if err != nil {
+					http.Error(w, fmt.Sprintf("Error parsing sender: %v", err), http.StatusBadRequest)
+					return
+				}
+			} else {
+				senderJID = types.JID{User: req.Sender, Server: "s.whatsapp.net"}
+			}
+		}
+		isFromMe, ts, _, found, err := messageStore.GetMessageMeta(req.MessageID, chatJID.String())
+		if err != nil {
+			respondStatusResult(w, fmt.Errorf("lookup message: %w", err), "")
+			return
+		}
+		if found {
+			if !isFromMe && req.Sender == "" {
+				http.Error(w, "not our message: pass sender (group admins only)", http.StatusBadRequest)
+				return
+			}
+			if time.Since(ts) > deleteWindow {
+				http.Error(w, fmt.Sprintf("delete window closed: message is %s old (WhatsApp allows ~%s)", time.Since(ts).Round(time.Hour), deleteWindow), http.StatusConflict)
+				return
+			}
+		}
+		if !client.IsConnected() {
+			respondStatusResult(w, fmt.Errorf("not connected to WhatsApp"), "")
+			return
+		}
+		resp, err := client.SendMessage(context.Background(), chatJID, client.BuildRevoke(chatJID, senderJID, req.MessageID))
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("Error deleting message: %v", err)})
+			return
+		}
+		if err := messageStore.MarkDeleted(req.MessageID, chatJID.String(), time.Now()); err != nil {
+			fmt.Printf("[delete] persist %s failed: %v\n", req.MessageID, err)
+		}
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Message deleted", MessageID: resp.ID})
 	})
 
 	// /api/status-react — react to someone's status/story with an emoji (the

@@ -689,6 +689,9 @@ type SendMessageRequest struct {
 	MediaBase64 string `json:"media_base64,omitempty"`
 	Filename    string `json:"filename,omitempty"`
 	MimeType    string `json:"mime_type,omitempty"`
+	// Mentions tags people in a text message. Each entry is a full JID or
+	// bare phone digits; write "@<digits>" in Message where the tag goes.
+	Mentions []string `json:"mentions,omitempty"`
 }
 
 // ReactRequest is the body for /api/react. The caller already has all fields
@@ -848,6 +851,7 @@ func sendWhatsAppMessage(
 	client *whatsmeow.Client,
 	messageStore *MessageStore,
 	recipient, message, mediaPath, mediaBase64, filename, mimeTypeOverride string,
+	mentions []string,
 ) (bool, string, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp", ""
@@ -926,7 +930,16 @@ func sendWhatsAppMessage(
 
 	default:
 		// Pure text message.
-		msg.Conversation = proto.String(message)
+		if len(mentions) > 0 {
+			var jids []string
+			message, jids = resolveMentions(client, recipientJID, message, mentions)
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: &waProto.ContextInfo{MentionedJID: jids},
+			}
+		} else {
+			msg.Conversation = proto.String(message)
+		}
 		resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 		if err != nil {
 			return false, fmt.Sprintf("Error sending message: %v", err), ""
@@ -1013,6 +1026,37 @@ func resolveCanonicalChatJID(client *whatsmeow.Client, recipient string) (types.
 		return resolved, registered, err
 	}
 	return preferLID(client, resolved), true, nil
+}
+
+// resolveMentions turns mention entries into JIDs and keeps the "@<user>"
+// tokens in text in sync. A LID-addressed group expects LID mentions, so a
+// bare phone is swapped for its LID there and "@<phone>" is rewritten to
+// "@<lid>"; WhatsApp then renders the token as the contact's name.
+func resolveMentions(client *whatsmeow.Client, chat types.JID, text string, mentions []string) (string, []string) {
+	jids := make([]string, 0, len(mentions))
+	for _, m := range mentions {
+		m = strings.TrimPrefix(strings.TrimSpace(m), "+")
+		var jid types.JID
+		if strings.Contains(m, "@") {
+			parsed, err := types.ParseJID(m)
+			if err != nil {
+				continue
+			}
+			jid = parsed
+		} else {
+			jid = types.JID{User: m, Server: types.DefaultUserServer}
+			if chat.Server == types.GroupServer {
+				jid = preferLID(client, jid)
+			}
+			if jid.User != m {
+				text = strings.ReplaceAll(text, "@"+m, "@"+jid.User)
+			}
+		}
+		if js := jid.String(); js != "" && jid.User != "" {
+			jids = append(jids, js)
+		}
+	}
+	return text, jids
 }
 
 // preferLID swaps a phone JID for the contact's LID when whatsmeow's own LID
@@ -1633,6 +1677,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			req.Recipient, req.Message,
 			req.MediaPath, req.MediaBase64,
 			req.Filename, req.MimeType,
+			req.Mentions,
 		)
 		w.Header().Set("Content-Type", "application/json")
 		if !success {

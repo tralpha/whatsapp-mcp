@@ -630,18 +630,43 @@ func (store *MessageStore) RecordCallReject(callID string, ts time.Time) error {
 	return err
 }
 
-// RecordCallTerminate stamps the moment the call ended + its reason.
-// With accepted_at NULL, terminate means the call was missed (never picked up).
-func (store *MessageStore) RecordCallTerminate(callID, reason string, ts time.Time) error {
+// MissedCall is an incoming call that ended with nobody answering or declining
+// it on any device.
+type MissedCall struct {
+	FromJID, Creator, Media string
+	IsGroup                 bool
+	OfferedAt               time.Time
+}
+
+// RecordCallTerminate stamps the moment the call ended + its reason, and
+// returns the call when it was missed. Answered or declined on the phone shows
+// up as accepted_at / rejected_at (reasons accepted_elsewhere /
+// rejected_elsewhere); a call with neither just rang out. The terminated_at IS
+// NULL guard makes a duplicate terminate event return nil, so the missed-call
+// webhook fires once per call.
+func (store *MessageStore) RecordCallTerminate(callID, reason string, ts time.Time) (*MissedCall, error) {
 	if callID == "" {
-		return nil
+		return nil, nil
 	}
-	_, err := store.db.Exec(
+	var mc MissedCall
+	var creator, media sql.NullString
+	var offered sql.NullTime
+	var missed bool
+	err := store.db.QueryRow(
 		`UPDATE calls SET terminated_at = $2, terminate_reason = $3
-		 WHERE call_id = $1 AND terminated_at IS NULL`,
+		 WHERE call_id = $1 AND terminated_at IS NULL
+		 RETURNING from_jid, call_creator, media, is_group, offered_at,
+		   accepted_at IS NULL AND rejected_at IS NULL AND $3 NOT IN ('accepted_elsewhere', 'rejected_elsewhere')`,
 		callID, ts, reason,
-	)
-	return err
+	).Scan(&mc.FromJID, &creator, &media, &mc.IsGroup, &offered, &missed)
+	if err == sql.ErrNoRows || (err == nil && !missed) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	mc.Creator, mc.Media, mc.OfferedAt = creator.String, media.String, offered.Time
+	return &mc, nil
 }
 
 // Extract text content from a message
@@ -775,6 +800,11 @@ type WebhookPayload struct {
 	Filename   string    `json:"filename,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
 	quote                // set when this message replies to an earlier one
+	// Event is empty for a message. "missed_call" marks a call nobody answered:
+	// Content then carries a readable line, and CallID / CallMedia the call.
+	Event     string `json:"event,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	CallMedia string `json:"call_media,omitempty"`
 }
 
 // maxMediaBytes caps accepted media payload size to protect the bridge from
@@ -1186,6 +1216,46 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
 	}
 	return "", "", "", nil, nil, nil, 0
+}
+
+// notifyMissedCall sends a missed call down the same webhook as an inbound
+// message, so every consumer (backend log, ntfy, Grok forward) sees it without
+// a second integration. Calls we placed ourselves are skipped.
+func notifyMissedCall(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger,
+	account, webhookURL, webhookSecret, callID string, mc *MissedCall) {
+	from, err := types.ParseJID(mc.FromJID)
+	if err != nil {
+		logger.Warnf("missed call %s: bad from_jid %q: %v", callID, mc.FromJID, err)
+		return
+	}
+	from = from.ToNonAD()
+	if client.Store != nil && client.Store.ID != nil && (from.User == client.Store.ID.User || strings.HasPrefix(mc.Creator, client.Store.ID.User+"@")) {
+		return
+	}
+	kind := "voice"
+	if mc.Media == "video" {
+		kind = "video"
+	}
+	chatJID := from.String()
+	name := GetChatName(client, store, from, chatJID, nil, from.User, logger)
+	ts := mc.OfferedAt
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	fmt.Printf("[%s] ☎  missed %s call from %s (%s)\n", ts.Format("2006-01-02 15:04:05"), kind, name, from.User)
+	fireWebhook(WebhookPayload{
+		Account:    account,
+		MessageID:  "call:" + callID,
+		ChatJID:    chatJID,
+		Sender:     from.User,
+		SenderName: name,
+		IsGroup:    mc.IsGroup,
+		Content:    fmt.Sprintf("📞 Missed WhatsApp %s call", kind),
+		Timestamp:  ts,
+		Event:      "missed_call",
+		CallID:     callID,
+		CallMedia:  kind,
+	}, webhookURL, webhookSecret)
 }
 
 // fireWebhook posts a payload to WEBHOOK_URL (best-effort, non-blocking).
@@ -2611,8 +2681,12 @@ func main() {
 				logger.Warnf("RecordCallReject: %v", err)
 			}
 		case *events.CallTerminate:
-			if err := messageStore.RecordCallTerminate(v.CallID, v.Reason, v.Timestamp); err != nil {
+			missed, err := messageStore.RecordCallTerminate(v.CallID, v.Reason, v.Timestamp)
+			if err != nil {
 				logger.Warnf("RecordCallTerminate: %v", err)
+			}
+			if missed != nil {
+				notifyMissedCall(client, messageStore, logger, account, webhookURL, webhookSecret, v.CallID, missed)
 			}
 			fmt.Printf("[%s] ☎  call terminated (id=%s reason=%s)\n", v.Timestamp.Format("2006-01-02 15:04:05"), v.CallID, v.Reason)
 		case *events.Receipt:

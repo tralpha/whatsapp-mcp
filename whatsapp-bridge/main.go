@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/mdp/qrterminal"
 
 	"go.mau.fi/whatsmeow"
@@ -119,6 +119,9 @@ func NewMessageStore(dsn string) (*MessageStore, error) {
 		ALTER TABLE messages ADD COLUMN IF NOT EXISTS quoted_message_id TEXT;
 		ALTER TABLE messages ADD COLUMN IF NOT EXISTS quoted_sender TEXT;
 		ALTER TABLE messages ADD COLUMN IF NOT EXISTS quoted_text TEXT;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS played_at TIMESTAMPTZ;
 		CREATE TABLE IF NOT EXISTS calls (
 			call_id TEXT PRIMARY KEY,
 			from_jid TEXT NOT NULL,
@@ -275,6 +278,51 @@ func extractQuote(msg *waProto.Message) quote {
 		sender = sender[:i] // match messages.sender, which stores the bare user
 	}
 	return quote{ID: ci.GetStanzaID(), Sender: sender, Text: text}
+}
+
+// RecordReceipt stores the recipient's ticks on our own messages: delivered
+// (two grey), read (two blue), played (voice note listened to). A later tick
+// implies the earlier ones, since a read receipt can arrive without a
+// delivered one. Each column keeps its first time. Matched on id alone: the
+// receipt's chat can be the phone JID while we stored the LID chat, and
+// message ids are unique. In a group the first participant's receipt wins.
+func (store *MessageStore) RecordReceipt(ids []string, rt types.ReceiptType, at time.Time) error {
+	var set string
+	switch rt {
+	case types.ReceiptTypeDelivered:
+		set = `delivered_at = COALESCE(delivered_at, $2)`
+	case types.ReceiptTypeRead:
+		set = `delivered_at = COALESCE(delivered_at, $2), read_at = COALESCE(read_at, $2)`
+	case types.ReceiptTypePlayed:
+		set = `delivered_at = COALESCE(delivered_at, $2), read_at = COALESCE(read_at, $2), played_at = COALESCE(played_at, $2)`
+	default:
+		return nil
+	}
+	_, err := store.db.Exec(`UPDATE messages SET `+set+` WHERE id = ANY($1) AND is_from_me`, pq.Array(ids), at)
+	return err
+}
+
+// UnreadInbound returns a chat's inbound message ids newer than its
+// last_read_at, grouped by sender (MarkRead takes one sender per call).
+func (store *MessageStore) UnreadInbound(chatJID string) (map[string][]string, error) {
+	rows, err := store.db.Query(
+		`SELECT m.id, m.sender FROM messages m LEFT JOIN chats c ON c.jid = m.chat_jid
+		 WHERE m.chat_jid = $1 AND NOT m.is_from_me AND m.deleted_at IS NULL
+		   AND m.timestamp > COALESCE(c.last_read_at, '-infinity')
+		 ORDER BY m.timestamp`, chatJID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var id, sender string
+		if err := rows.Scan(&id, &sender); err != nil {
+			return nil, err
+		}
+		out[sender] = append(out[sender], id)
+	}
+	return out, rows.Err()
 }
 
 // ApplyEdit records an edit: content becomes the new text and the first
@@ -2105,6 +2153,66 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: true, Message: "Message deleted", MessageID: resp.ID})
 	})
 
+	// /api/mark-read — turn a chat's ticks blue on the guest's side and clear
+	// it from /api/unread. Never automatic: blue ticks tell the guest a human
+	// read them, so only call this when one did (or a reply went out).
+	// message_ids empty = every unread inbound message in the chat; sender is
+	// only needed for explicit ids in a group.
+	mux.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatJID    string   `json:"chat_jid"`
+			MessageIDs []string `json:"message_ids"`
+			Sender     string   `json:"sender"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if req.ChatJID == "" || err != nil {
+			http.Error(w, "valid chat_jid is required", http.StatusBadRequest)
+			return
+		}
+		bySender := map[string][]string{req.Sender: req.MessageIDs}
+		if len(req.MessageIDs) == 0 {
+			if bySender, err = messageStore.UnreadInbound(chatJID.String()); err != nil {
+				respondStatusResult(w, fmt.Errorf("lookup unread: %w", err), "")
+				return
+			}
+		}
+		if !client.IsConnected() {
+			respondStatusResult(w, fmt.Errorf("not connected to WhatsApp"), "")
+			return
+		}
+		now, marked := time.Now(), 0
+		for sender, ids := range bySender {
+			if len(ids) == 0 {
+				continue
+			}
+			senderJID := types.EmptyJID
+			if sender != "" && chatJID.Server == types.GroupServer {
+				if strings.Contains(sender, "@") {
+					senderJID, _ = types.ParseJID(sender)
+				} else {
+					senderJID = types.JID{User: sender, Server: types.DefaultUserServer}
+				}
+			}
+			if err := client.MarkRead(context.Background(), ids, now, chatJID, senderJID); err != nil {
+				respondStatusResult(w, fmt.Errorf("mark read: %w", err), "")
+				return
+			}
+			marked += len(ids)
+		}
+		if err := messageStore.UpdateLastRead(chatJID.String(), now); err != nil {
+			fmt.Printf("[mark-read] UpdateLastRead %s: %v\n", chatJID, err)
+		}
+		respondStatusResult(w, nil, fmt.Sprintf("marked %d message(s) read", marked))
+	})
+
 	// /api/status-react — react to someone's status/story with an emoji (the
 	// status reaction bar). This is a normal reaction whose target key lives in
 	// status@broadcast: the reaction chat is StatusBroadcastJID, the reacted
@@ -2700,6 +2808,11 @@ func main() {
 					if err := messageStore.RecordStatusView(mid, viewer, v.Timestamp); err != nil {
 						logger.Warnf("RecordStatusView: %v", err)
 					}
+				}
+			} else if !v.MessageSource.IsFromMe && v.MessageSource.Chat.String() != "status@broadcast" {
+				// The other side's ticks on messages we sent.
+				if err := messageStore.RecordReceipt(v.MessageIDs, v.Type, v.Timestamp); err != nil {
+					logger.Warnf("RecordReceipt: %v", err)
 				}
 			} else if v.MessageSource.IsFromMe && v.MessageSource.Chat.String() != "status@broadcast" &&
 				(v.Type == types.ReceiptTypeRead || v.Type == types.ReceiptTypeReadSelf ||

@@ -283,10 +283,11 @@ func extractQuote(msg *waProto.Message) quote {
 // RecordReceipt stores the recipient's ticks on our own messages: delivered
 // (two grey), read (two blue), played (voice note listened to). A later tick
 // implies the earlier ones, since a read receipt can arrive without a
-// delivered one. Each column keeps its first time. Matched on id alone: the
-// receipt's chat can be the phone JID while we stored the LID chat, and
-// message ids are unique. In a group the first participant's receipt wins.
-func (store *MessageStore) RecordReceipt(ids []string, rt types.ReceiptType, at time.Time) error {
+// delivered one. Each column keeps its first time. chats holds the receipt's
+// chat in both its phone and LID forms (we may have stored either), so a
+// receipt can only tick messages in its own chat. In a group the first
+// participant's receipt wins.
+func (store *MessageStore) RecordReceipt(ids, chats []string, rt types.ReceiptType, at time.Time) error {
 	var set string
 	switch rt {
 	case types.ReceiptTypeDelivered:
@@ -298,7 +299,7 @@ func (store *MessageStore) RecordReceipt(ids []string, rt types.ReceiptType, at 
 	default:
 		return nil
 	}
-	_, err := store.db.Exec(`UPDATE messages SET `+set+` WHERE id = ANY($1) AND is_from_me`, pq.Array(ids), at)
+	_, err := store.db.Exec(`UPDATE messages SET `+set+` WHERE id = ANY($1) AND is_from_me AND chat_jid = ANY($3)`, pq.Array(ids), at, pq.Array(chats))
 	return err
 }
 
@@ -1149,6 +1150,27 @@ func preferLID(client *whatsmeow.Client, jid types.JID) types.JID {
 		return jid
 	}
 	return lid
+}
+
+// chatForms returns a DM chat JID in both its phone-number and LID forms,
+// since rows are stored under whichever the bridge resolved at write time.
+func chatForms(client *whatsmeow.Client, chat types.JID) []string {
+	chat = chat.ToNonAD()
+	forms := []string{chat.String()}
+	if client.Store == nil || client.Store.LIDs == nil {
+		return forms
+	}
+	var alt types.JID
+	switch chat.Server {
+	case types.DefaultUserServer:
+		alt, _ = client.Store.LIDs.GetLIDForPN(context.Background(), chat)
+	case types.HiddenUserServer:
+		alt, _ = client.Store.LIDs.GetPNForLID(context.Background(), chat)
+	}
+	if !alt.IsEmpty() {
+		forms = append(forms, alt.String())
+	}
+	return forms
 }
 
 // resolveViaIsOnWhatsApp queries WhatsApp for the canonical JID of a bare phone
@@ -2811,7 +2833,7 @@ func main() {
 				}
 			} else if !v.MessageSource.IsFromMe && v.MessageSource.Chat.String() != "status@broadcast" {
 				// The other side's ticks on messages we sent.
-				if err := messageStore.RecordReceipt(v.MessageIDs, v.Type, v.Timestamp); err != nil {
+				if err := messageStore.RecordReceipt(v.MessageIDs, chatForms(client, v.MessageSource.Chat), v.Type, v.Timestamp); err != nil {
 					logger.Warnf("RecordReceipt: %v", err)
 				}
 			} else if v.MessageSource.IsFromMe && v.MessageSource.Chat.String() != "status@broadcast" &&

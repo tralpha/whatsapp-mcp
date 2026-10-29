@@ -367,13 +367,39 @@ var (
 	presenceWaiters = map[string][]chan struct{}{}
 )
 
+// notifyPresence wakes waiters with a non-blocking send on a 1-slot channel,
+// never a close: one waiter sits under both a contact's phone and LID keys, so
+// two events would otherwise close it twice and panic the bridge.
 func notifyPresence(jid string) {
 	presenceMu.Lock()
 	defer presenceMu.Unlock()
 	for _, ch := range presenceWaiters[jid] {
-		close(ch)
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
 	}
-	delete(presenceWaiters, jid)
+}
+
+// removePresenceWaiter unregisters ch from every key, so finished or timed-out
+// requests don't accumulate.
+func removePresenceWaiter(keys []string, ch chan struct{}) {
+	presenceMu.Lock()
+	defer presenceMu.Unlock()
+	for _, k := range keys {
+		list := presenceWaiters[k]
+		for i, c := range list {
+			if c == ch {
+				list = append(list[:i], list[i+1:]...)
+				break
+			}
+		}
+		if len(list) == 0 {
+			delete(presenceWaiters, k)
+		} else {
+			presenceWaiters[k] = list
+		}
+	}
 }
 
 // ApplyEdit records an edit: content becomes the new text and the first
@@ -2327,12 +2353,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			return
 		}
 		forms := chatForms(client, jid)
-		ch := make(chan struct{})
+		ch := make(chan struct{}, 1)
 		presenceMu.Lock()
 		for _, f := range forms {
 			presenceWaiters[f] = append(presenceWaiters[f], ch)
 		}
 		presenceMu.Unlock()
+		defer removePresenceWaiter(forms, ch)
 		subscribed := time.Now()
 		if err := client.SubscribePresence(r.Context(), jid); err != nil {
 			respondStatusResult(w, fmt.Errorf("subscribe presence: %w", err), "")

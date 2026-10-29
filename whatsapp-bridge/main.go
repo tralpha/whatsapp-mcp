@@ -2874,7 +2874,11 @@ func main() {
 			handleHistorySync(client, messageStore, v, logger)
 		case *events.MediaRetry:
 			if !retryCoordinator.deliver(v) {
-				logger.Warnf("Received media retry response with no pending request: %s", v.MessageID)
+				if err := persistLateMediaRetry(messageStore, v); err != nil {
+					logger.Warnf("Late media retry for %s not saved: %v", v.MessageID, err)
+				} else {
+					logger.Infof("Saved late media retry for %s; next fetch will download it", v.MessageID)
+				}
 			}
 		case *events.Connected:
 			logger.Infof("✓ Connected to WhatsApp")

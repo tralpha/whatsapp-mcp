@@ -89,3 +89,23 @@ func shouldRetryMediaDownload(err error) bool {
 		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
 		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410)
 }
+
+// persistLateMediaRetry saves a re-upload reply that arrived after the HTTP
+// request stopped waiting. Phones often answer minutes or hours later (when they
+// wake), so without this the reply is lost and every fetch times out again.
+func persistLateMediaRetry(store *MessageStore, evt *events.MediaRetry) error {
+	chatJID := evt.ChatID.String()
+	_, _, _, mediaKey, _, _, _, err := store.GetMediaInfo(string(evt.MessageID), chatJID)
+	if err != nil {
+		return fmt.Errorf("load media key: %w", err)
+	}
+	notification, err := whatsmeow.DecryptMediaRetryNotification(evt, mediaKey)
+	if err != nil {
+		return fmt.Errorf("decrypt: %w", err)
+	}
+	directPath := notification.GetDirectPath()
+	if directPath == "" {
+		return errors.New("empty direct path")
+	}
+	return store.UpdateMediaURL(string(evt.MessageID), chatJID, directPath)
+}

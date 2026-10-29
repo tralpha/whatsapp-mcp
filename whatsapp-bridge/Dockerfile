@@ -8,7 +8,7 @@ COPY whatsapp-bridge/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/bridge .
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 bridge
+RUN apk add --no-cache ca-certificates tzdata ffmpeg && adduser -D -u 10001 bridge
 WORKDIR /app
 COPY --from=builder /out/bridge /app/bridge
 USER bridge

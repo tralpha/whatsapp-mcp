@@ -16,12 +16,14 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -137,6 +139,12 @@ func NewMessageStore(dsn string) (*MessageStore, error) {
 			version TEXT
 		);
 		CREATE INDEX IF NOT EXISTS calls_offered_at_idx ON calls (offered_at DESC);
+		CREATE TABLE IF NOT EXISTS presence (
+			jid TEXT PRIMARY KEY,
+			online BOOLEAN NOT NULL,
+			last_seen TIMESTAMPTZ,
+			updated_at TIMESTAMPTZ NOT NULL
+		);
 		CREATE TABLE IF NOT EXISTS status_views (
 			status_message_id TEXT,
 			viewer_jid TEXT,
@@ -324,6 +332,48 @@ func (store *MessageStore) UnreadInbound(chatJID string) (map[string][]string, e
 		out[sender] = append(out[sender], id)
 	}
 	return out, rows.Err()
+}
+
+// RecordPresence keeps the latest online / last-seen state per contact. A zero
+// lastSeen (contact hides it) keeps the last known value.
+func (store *MessageStore) RecordPresence(jid string, online bool, lastSeen time.Time) error {
+	var ls any
+	if !lastSeen.IsZero() {
+		ls = lastSeen
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO presence (jid, online, last_seen, updated_at) VALUES ($1, $2, $3, now())
+		 ON CONFLICT (jid) DO UPDATE SET online = EXCLUDED.online,
+		   last_seen = COALESCE(EXCLUDED.last_seen, presence.last_seen), updated_at = now()`,
+		jid, online, ls)
+	return err
+}
+
+// GetPresence returns the newest stored presence across a contact's JID forms.
+func (store *MessageStore) GetPresence(jids []string) (online bool, lastSeen *time.Time, updated time.Time, found bool, err error) {
+	err = store.db.QueryRow(
+		`SELECT online, last_seen, updated_at FROM presence WHERE jid = ANY($1) ORDER BY updated_at DESC LIMIT 1`,
+		pq.Array(jids)).Scan(&online, &lastSeen, &updated)
+	if err == sql.ErrNoRows {
+		return false, nil, time.Time{}, false, nil
+	}
+	return online, lastSeen, updated, err == nil, err
+}
+
+// presenceWaiters lets /api/last-seen block until the presence reply for a
+// contact it just subscribed to arrives.
+var (
+	presenceMu      sync.Mutex
+	presenceWaiters = map[string][]chan struct{}{}
+)
+
+func notifyPresence(jid string) {
+	presenceMu.Lock()
+	defer presenceMu.Unlock()
+	for _, ch := range presenceWaiters[jid] {
+		close(ch)
+	}
+	delete(presenceWaiters, jid)
 }
 
 // ApplyEdit records an edit: content becomes the new text and the first
@@ -888,6 +938,8 @@ func resolveMediaKind(filename string) (whatsmeow.MediaType, string) {
 		return whatsmeow.MediaAudio, "audio/ogg; codecs=opus"
 	case "mp3":
 		return whatsmeow.MediaAudio, "audio/mpeg"
+	case "m4a", "aac", "wav", "opus", "amr", "flac", "caf":
+		return whatsmeow.MediaAudio, "audio/" + ext // transcoded to Opus before upload
 	case "mp4":
 		return whatsmeow.MediaVideo, "video/mp4"
 	case "avi":
@@ -1025,6 +1077,21 @@ func sendWhatsAppMessage(
 		}
 		persistOutbound(client, messageStore, resp.ID, recipientJID, message, "", "")
 		return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID
+	}
+
+	// A voice note only plays as one when it is Ogg/Opus: an mp3 or m4a sent
+	// with PTT=true shows a broken bubble or no duration. Anything else is
+	// transcoded first, so callers can send whatever their recorder produced.
+	if mediaType == whatsmeow.MediaAudio {
+		if _, _, oggErr := analyzeOggOpus(mediaData); oggErr != nil {
+			opus, convErr := toOpusVoice(mediaData, filepath.Ext(docFilename))
+			if convErr != nil {
+				return false, fmt.Sprintf("Error converting audio to a voice note: %v", convErr), ""
+			}
+			mediaData, mimeType = opus, "audio/ogg; codecs=opus"
+		} else {
+			mimeType = "audio/ogg; codecs=opus"
+		}
 	}
 
 	resp, err := client.Upload(context.Background(), mediaData, mediaType)
@@ -2235,6 +2302,62 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 		respondStatusResult(w, nil, fmt.Sprintf("marked %d message(s) read", marked))
 	})
 
+	// /api/last-seen?phone=<digits> (or jid=<jid>) — the contact's online state
+	// and last-seen time. Subscribes to their presence, waits up to 8 s for
+	// WhatsApp's reply, then answers from the presence table (also kept fresh by
+	// later presence events). WhatsApp only shares last seen when the contact
+	// allows it AND our own account shows its last seen: hidden either way
+	// returns last_seen null with hidden=true.
+	mux.HandleFunc("/api/last-seen", func(w http.ResponseWriter, r *http.Request) {
+		target := r.URL.Query().Get("jid")
+		if target == "" {
+			target = sanitizePhone(r.URL.Query().Get("phone"))
+		}
+		if target == "" {
+			http.Error(w, "phone or jid is required", http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() {
+			respondStatusResult(w, fmt.Errorf("not connected to WhatsApp"), "")
+			return
+		}
+		jid, registered, err := resolveCanonicalChatJID(client, target)
+		if err != nil || !registered {
+			http.Error(w, fmt.Sprintf("not on WhatsApp: %s", target), http.StatusNotFound)
+			return
+		}
+		forms := chatForms(client, jid)
+		ch := make(chan struct{})
+		presenceMu.Lock()
+		for _, f := range forms {
+			presenceWaiters[f] = append(presenceWaiters[f], ch)
+		}
+		presenceMu.Unlock()
+		subscribed := time.Now()
+		if err := client.SubscribePresence(r.Context(), jid); err != nil {
+			respondStatusResult(w, fmt.Errorf("subscribe presence: %w", err), "")
+			return
+		}
+		select {
+		case <-ch:
+		case <-time.After(8 * time.Second):
+		case <-r.Context().Done():
+		}
+		online, lastSeen, updated, found, err := messageStore.GetPresence(forms)
+		if err != nil {
+			respondStatusResult(w, err, "")
+			return
+		}
+		resp := map[string]any{"success": true, "jid": jid.String(), "online": online, "last_seen": lastSeen,
+			"fresh": found && !updated.Before(subscribed), "hidden": !online && lastSeen == nil}
+		if !found {
+			resp["message"] = "WhatsApp sent no presence: the contact or our account hides last seen"
+			resp["hidden"] = true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
 	// /api/status-react — react to someone's status/story with an emoji (the
 	// status reaction bar). This is a normal reaction whose target key lives in
 	// status@broadcast: the reaction chat is StatusBroadcastJID, the reacted
@@ -2819,6 +2942,12 @@ func main() {
 				notifyMissedCall(client, messageStore, logger, account, webhookURL, webhookSecret, v.CallID, missed)
 			}
 			fmt.Printf("[%s] ☎  call terminated (id=%s reason=%s)\n", v.Timestamp.Format("2006-01-02 15:04:05"), v.CallID, v.Reason)
+		case *events.Presence:
+			jid := v.From.ToNonAD().String()
+			if err := messageStore.RecordPresence(jid, !v.Unavailable, v.LastSeen); err != nil {
+				logger.Warnf("RecordPresence: %v", err)
+			}
+			notifyPresence(jid)
 		case *events.Receipt:
 			// A read/played receipt whose chat is status@broadcast means someone
 			// viewed OUR status. MessageIDs reference our status posts; the viewer
@@ -3234,6 +3363,28 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+}
+
+// toOpusVoice transcodes any audio ffmpeg can read into mono 48 kHz Ogg/Opus,
+// WhatsApp's voice-note format. Input goes through a temp file, not a pipe:
+// m4a keeps its index at the end of the file and can't be read from stdin.
+func toOpusVoice(data []byte, ext string) ([]byte, error) {
+	in, err := writeSecureTempFile(data, ext)
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(in)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", in,
+		"-vn", "-ac", "1", "-ar", "48000", "-c:a", "libopus", "-b:a", "32k", "-application", "voip", "-f", "ogg", "pipe:1")
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ffmpeg: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return out, nil
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file

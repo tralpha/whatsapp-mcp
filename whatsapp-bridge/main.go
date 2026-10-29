@@ -2360,7 +2360,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 		}
 		presenceMu.Unlock()
 		defer removePresenceWaiter(forms, ch)
-		subscribed := time.Now()
 		if err := client.SubscribePresence(r.Context(), jid); err != nil {
 			respondStatusResult(w, fmt.Errorf("subscribe presence: %w", err), "")
 			return
@@ -2375,8 +2374,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			respondStatusResult(w, err, "")
 			return
 		}
+		// as_of is when WhatsApp last told us this contact's state. WhatsApp sends
+		// presence once per subscription and then only on change, so a repeat
+		// lookup can be old yet still current.
 		resp := map[string]any{"success": true, "jid": jid.String(), "online": online, "last_seen": lastSeen,
-			"fresh": found && !updated.Before(subscribed), "hidden": !online && lastSeen == nil}
+			"as_of": updated, "hidden": !online && lastSeen == nil}
 		if !found {
 			resp["message"] = "WhatsApp sent no presence: the contact or our account hides last seen"
 			resp["hidden"] = true

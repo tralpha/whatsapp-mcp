@@ -62,29 +62,35 @@ func (cli *Client) getStatusBroadcastRecipients(ctx context.Context) ([]types.JI
 	}
 
 	// Vita patch (2026-11-08): the exclude list can name a person by LID while the
-	// contact store keys them by phone number (or the reverse). Matching literally
-	// would have sent statuses to 19 of 23 excluded people. Index both forms, and
-	// ask the server for any contact's missing LID before filtering.
+	// contact store keys them by phone number (or the reverse), and a literal match
+	// would have sent statuses to 19 of 23 excluded people. Index both forms from
+	// the stored LID<->PN pairs. If an excluded person is known only by LID, any
+	// phone-number contact whose LID is unknown is withheld (fail closed). No server
+	// lookups: bulk usync for ~1800 contacts was rate limited (429).
 	blacklist := make(map[types.JID]struct{})
-	if statusPrivacy.Type == types.StatusPrivacyTypeBlacklist && len(statusPrivacy.List) > 0 {
-		if err = cli.resolveMissingContactLIDs(ctx, contacts); err != nil {
-			return nil, fmt.Errorf("failed to resolve contact LIDs for status privacy: %w", err)
-		}
+	lidOnlyExcluded := false
+	if statusPrivacy.Type == types.StatusPrivacyTypeBlacklist {
 		for _, jid := range statusPrivacy.List {
 			jid = jid.ToNonAD()
 			blacklist[jid] = struct{}{}
 			if alt := cli.altLIDOrPN(ctx, jid); !alt.IsEmpty() {
 				blacklist[alt] = struct{}{}
+			} else if jid.Server == types.HiddenUserServer {
+				lidOnlyExcluded = true
 			}
 		}
 	}
 
 	var contactsArray []types.JID
 	for jid, contact := range contacts {
-		_, isBlacklisted := blacklist[jid.ToNonAD()]
+		jid = jid.ToNonAD()
+		_, isBlacklisted := blacklist[jid]
 		if !isBlacklisted && len(blacklist) > 0 {
-			if alt := cli.altLIDOrPN(ctx, jid.ToNonAD()); !alt.IsEmpty() {
+			alt := cli.altLIDOrPN(ctx, jid)
+			if !alt.IsEmpty() {
 				_, isBlacklisted = blacklist[alt]
+			} else if lidOnlyExcluded && jid.Server == types.DefaultUserServer {
+				isBlacklisted = true // cannot prove this is not an excluded person
 			}
 		}
 		if isBlacklisted {
@@ -173,28 +179,4 @@ func (cli *Client) altLIDOrPN(ctx context.Context, jid types.JID) types.JID {
 		return types.JID{}
 	}
 	return alt
-}
-
-// resolveMissingContactLIDs asks the server for the LID of every phone-number
-// contact that has none stored, and stores the pairs (Vita patch).
-func (cli *Client) resolveMissingContactLIDs(ctx context.Context, contacts map[types.JID]types.ContactInfo) error {
-	var missing []types.JID
-	for jid := range contacts {
-		if jid.Server == types.DefaultUserServer && cli.altLIDOrPN(ctx, jid.ToNonAD()).IsEmpty() {
-			missing = append(missing, jid.ToNonAD())
-		}
-	}
-	for start := 0; start < len(missing); start += 100 {
-		end := min(start+100, len(missing))
-		infos, err := cli.GetUserInfo(ctx, missing[start:end])
-		if err != nil {
-			return err
-		}
-		for pn, info := range infos {
-			if !info.LID.IsEmpty() {
-				cli.StoreLIDPNMapping(ctx, info.LID, pn)
-			}
-		}
-	}
-	return nil
 }

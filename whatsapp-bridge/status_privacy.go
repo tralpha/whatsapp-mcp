@@ -20,6 +20,7 @@ type StatusRecipientReport struct {
 	Recipients   int      `json:"recipients"`   // people the status goes to
 	Leaked       []string `json:"leaked"`       // excluded people who would still receive it
 	Unverifiable int      `json:"unverifiable"` // recipients with no LID while some excluded person has no phone number on file
+	Withheld     int      `json:"withheld"`     // phone-number contacts held back because their LID is unknown
 }
 
 // statusRecipientReport checks every recipient under both its phone-number and
@@ -50,6 +51,19 @@ func statusRecipientReport(ctx context.Context, cli *whatsmeow.Client) (StatusRe
 			excluded[alt] = j.User
 		} else if j.Server == types.HiddenUserServer {
 			lidOnly = true
+		}
+	}
+	if lidOnly {
+		if contacts, err := cli.Store.Contacts.GetAllContacts(ctx); err == nil {
+			for c, info := range contacts {
+				c = c.ToNonAD()
+				if info.FullName == "" || c.Server != types.DefaultUserServer {
+					continue
+				}
+				if alt, err := altJID(ctx, cli, c); err != nil || alt.IsEmpty() {
+					rep.Withheld++
+				}
+			}
 		}
 	}
 	for _, r := range recipients {

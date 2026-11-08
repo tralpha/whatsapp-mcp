@@ -1,5 +1,5 @@
 whatsapp-client
 bridge
-store/
+/store/
 *.db
 *.db-journal

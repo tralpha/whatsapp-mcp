@@ -1840,15 +1840,6 @@ func mimeForMediaType(mediaType, filename string) string {
 }
 
 // respondStatusResult writes a uniform JSON response for /api/status.
-func respondStatusPosted(w http.ResponseWriter, err error, id, okMsg string) {
-	if err != nil {
-		respondStatusResult(w, err, "")
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "message": okMsg, "message_id": id})
-}
-
 func respondStatusResult(w http.ResponseWriter, err error, okMsg string) {
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
@@ -2741,8 +2732,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 		// Text-only path
 		if req.MediaBase64 == "" {
 			msg := &waProto.Message{Conversation: proto.String(req.Message)}
-			resp, err := client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
-			respondStatusPosted(w, err, resp.ID, "status posted (text)")
+			sendStatusAsync(w, client, msg, "text")
 			return
 		}
 
@@ -2795,8 +2785,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 				JPEGThumbnail: thumb, Width: optU32(width), Height: optU32(height), Seconds: optU32(secs),
 			}
 		}
-		resp, err := client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
-		respondStatusPosted(w, err, resp.ID, fmt.Sprintf("status posted (%s, %d bytes)", mediaType, len(mediaBytes)))
+		sendStatusAsync(w, client, msg, fmt.Sprintf("%s, %d bytes", mediaType, len(mediaBytes)))
+	})
+
+	// /api/status/result?id=... — outcome of an async status send: pending | sent | failed.
+	mux.HandleFunc("/api/status/result", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(statusResult(r.URL.Query().Get("id")))
 	})
 
 	// /api/status/delete — delete one of our statuses for everyone. Body: {"message_id": "..."}
@@ -2812,8 +2807,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			http.Error(w, "message_id required", http.StatusBadRequest)
 			return
 		}
-		_, err := client.SendMessage(r.Context(), types.StatusBroadcastJID, client.BuildRevoke(types.StatusBroadcastJID, types.EmptyJID, req.MessageID))
-		respondStatusResult(w, err, "status deleted "+req.MessageID)
+		// A revoke goes to the same ~1850 recipients, so it is async too.
+		sendStatusAsync(w, client, client.BuildRevoke(types.StatusBroadcastJID, types.EmptyJID, req.MessageID), "delete "+req.MessageID)
 	})
 
 	// /api/status/recipients — dry run: who a status would reach right now, and

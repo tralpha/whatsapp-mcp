@@ -48,3 +48,5 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
+
+replace go.mau.fi/whatsmeow => ./third_party/whatsmeow

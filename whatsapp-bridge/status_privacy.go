@@ -13,19 +13,18 @@ import (
 )
 
 // StatusRecipientReport is what a status post would reach, computed the same way
-// whatsmeow does it (privacy setting + contact store), plus a leak check.
+// the (patched) library does it, plus an independent leak check.
 type StatusRecipientReport struct {
-	PrivacyType string   `json:"privacy_type"` // contacts | blacklist | whitelist
-	ListCount   int      `json:"list_count"`   // people on the except/only list
-	Recipients  int      `json:"recipients"`   // devices' owners the status goes to
-	Leaked      []string `json:"leaked"`       // excluded people who would still receive it
-	Unmapped    int      `json:"unmapped"`     // excluded people with no LID<->phone mapping (checked as-is)
+	PrivacyType  string   `json:"privacy_type"` // contacts | blacklist | whitelist
+	ListCount    int      `json:"list_count"`   // people on the except/only list
+	Recipients   int      `json:"recipients"`   // people the status goes to
+	Leaked       []string `json:"leaked"`       // excluded people who would still receive it
+	Unverifiable int      `json:"unverifiable"` // recipients with no LID while some excluded person has no phone number on file
 }
 
-// statusRecipientReport flags an excluded contact as leaked if they, or their
-// LID/phone-number twin, are in the recipient set. The contact store can hold a
-// person under one form while the privacy list names the other, and whatsmeow
-// compares them literally.
+// statusRecipientReport checks every recipient under both its phone-number and
+// LID form against the exclude list (also under both forms). The contact store
+// and the privacy list do not use the same form, so a literal comparison misses.
 func statusRecipientReport(ctx context.Context, cli *whatsmeow.Client) (StatusRecipientReport, error) {
 	var rep StatusRecipientReport
 	privacy, err := cli.GetStatusPrivacy(ctx)
@@ -39,21 +38,29 @@ func statusRecipientReport(ctx context.Context, cli *whatsmeow.Client) (StatusRe
 		return rep, err
 	}
 	rep.Recipients = len(recipients)
-	if p.Type != types.StatusPrivacyTypeBlacklist {
+	if p.Type != types.StatusPrivacyTypeBlacklist || len(p.List) == 0 {
 		return rep, nil
 	}
-	in := make(map[string]bool, len(recipients))
-	for _, j := range recipients {
-		in[j.ToNonAD().String()] = true
-	}
+	excluded := map[types.JID]string{}
+	lidOnly := false // an excluded person known only by LID
 	for _, j := range p.List {
 		j = j.ToNonAD()
-		alt, aerr := altJID(ctx, cli, j)
-		if aerr != nil || alt.IsEmpty() {
-			rep.Unmapped++
+		excluded[j] = j.User
+		if alt, err := altJID(ctx, cli, j); err == nil && !alt.IsEmpty() {
+			excluded[alt] = j.User
+		} else if j.Server == types.HiddenUserServer {
+			lidOnly = true
 		}
-		if in[j.String()] || (!alt.IsEmpty() && in[alt.String()]) {
-			rep.Leaked = append(rep.Leaked, j.User)
+	}
+	for _, r := range recipients {
+		r = r.ToNonAD()
+		alt, aerr := altJID(ctx, cli, r)
+		if who, ok := excluded[r]; ok {
+			rep.Leaked = append(rep.Leaked, who)
+		} else if who, ok := excluded[alt]; aerr == nil && ok {
+			rep.Leaked = append(rep.Leaked, who)
+		} else if lidOnly && r.Server == types.DefaultUserServer && (aerr != nil || alt.IsEmpty()) {
+			rep.Unverifiable++
 		}
 	}
 	return rep, nil

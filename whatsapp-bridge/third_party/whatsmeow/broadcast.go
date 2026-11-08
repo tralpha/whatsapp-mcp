@@ -1,0 +1,200 @@
+// Copyright (c) 2022 Tulir Asokan
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package whatsmeow
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/types"
+)
+
+func (cli *Client) getBroadcastListParticipants(ctx context.Context, jid types.JID) ([]types.JID, error) {
+	var list []types.JID
+	var err error
+	if jid == types.StatusBroadcastJID {
+		list, err = cli.getStatusBroadcastRecipients(ctx)
+	} else {
+		return nil, ErrBroadcastListUnsupported
+	}
+	if err != nil {
+		return nil, err
+	}
+	ownID := cli.getOwnID().ToNonAD()
+	if ownID.IsEmpty() {
+		return nil, ErrNotLoggedIn
+	}
+
+	selfIndex := -1
+	for i, participant := range list {
+		if participant.User == ownID.User {
+			selfIndex = i
+			break
+		}
+	}
+	if selfIndex < 0 {
+		list = append(list, ownID)
+	}
+	return list, nil
+}
+
+func (cli *Client) getStatusBroadcastRecipients(ctx context.Context) ([]types.JID, error) {
+	statusPrivacyOptions, err := cli.GetStatusPrivacy(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get status privacy: %w", err)
+	}
+	statusPrivacy := statusPrivacyOptions[0]
+	if statusPrivacy.Type == types.StatusPrivacyTypeWhitelist {
+		// Whitelist mode, just return the list
+		return statusPrivacy.List, nil
+	}
+
+	// Blacklist or all contacts mode. Find all contacts from database, then filter them appropriately.
+	contacts, err := cli.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get contact list from db: %w", err)
+	}
+
+	// Vita patch (2026-11-08): the exclude list can name a person by LID while the
+	// contact store keys them by phone number (or the reverse). Matching literally
+	// would have sent statuses to 19 of 23 excluded people. Index both forms, and
+	// ask the server for any contact's missing LID before filtering.
+	blacklist := make(map[types.JID]struct{})
+	if statusPrivacy.Type == types.StatusPrivacyTypeBlacklist && len(statusPrivacy.List) > 0 {
+		if err = cli.resolveMissingContactLIDs(ctx, contacts); err != nil {
+			return nil, fmt.Errorf("failed to resolve contact LIDs for status privacy: %w", err)
+		}
+		for _, jid := range statusPrivacy.List {
+			jid = jid.ToNonAD()
+			blacklist[jid] = struct{}{}
+			if alt := cli.altLIDOrPN(ctx, jid); !alt.IsEmpty() {
+				blacklist[alt] = struct{}{}
+			}
+		}
+	}
+
+	var contactsArray []types.JID
+	for jid, contact := range contacts {
+		_, isBlacklisted := blacklist[jid.ToNonAD()]
+		if !isBlacklisted && len(blacklist) > 0 {
+			if alt := cli.altLIDOrPN(ctx, jid.ToNonAD()); !alt.IsEmpty() {
+				_, isBlacklisted = blacklist[alt]
+			}
+		}
+		if isBlacklisted {
+			continue
+		}
+		// TODO should there be a better way to separate contacts and found push names in the db?
+		if len(contact.FullName) > 0 {
+			contactsArray = append(contactsArray, jid)
+		}
+	}
+	return contactsArray, nil
+}
+
+var DefaultStatusPrivacy = []types.StatusPrivacy{{
+	Type:      types.StatusPrivacyTypeContacts,
+	IsDefault: true,
+}}
+
+// GetStatusPrivacy gets the user's status privacy settings (who to send status broadcasts to).
+//
+// There can be multiple different stored settings, the first one is always the default.
+func (cli *Client) GetStatusPrivacy(ctx context.Context) ([]types.StatusPrivacy, error) {
+	resp, err := cli.sendIQ(ctx, infoQuery{
+		Namespace: "status",
+		Type:      iqGet,
+		To:        types.ServerJID,
+		Content: []waBinary.Node{{
+			Tag: "privacy",
+		}},
+	})
+	if err != nil {
+		if errors.Is(err, ErrIQNotFound) {
+			return DefaultStatusPrivacy, nil
+		}
+		return nil, err
+	}
+	privacyLists := resp.GetChildByTag("privacy")
+	var outputs []types.StatusPrivacy
+	for _, list := range privacyLists.GetChildren() {
+		if list.Tag != "list" {
+			continue
+		}
+
+		ag := list.AttrGetter()
+		var out types.StatusPrivacy
+		out.IsDefault = ag.OptionalBool("default")
+		out.Type = types.StatusPrivacyType(ag.String("type"))
+		children := list.GetChildren()
+		if len(children) > 0 {
+			out.List = make([]types.JID, 0, len(children))
+			for _, child := range children {
+				jid, ok := child.Attrs["jid"].(types.JID)
+				if child.Tag == "user" && ok {
+					out.List = append(out.List, jid)
+				}
+			}
+		}
+		outputs = append(outputs, out)
+		if out.IsDefault {
+			// Move default to always be first in the list
+			outputs[len(outputs)-1] = outputs[0]
+			outputs[0] = out
+		}
+		if len(ag.Errors) > 0 {
+			return nil, ag.Error()
+		}
+	}
+	if len(outputs) == 0 {
+		return DefaultStatusPrivacy, nil
+	}
+	return outputs, nil
+}
+
+// altLIDOrPN returns the stored LID for a phone-number JID, or the phone number
+// for a LID (Vita patch). Empty when no mapping is known.
+func (cli *Client) altLIDOrPN(ctx context.Context, jid types.JID) types.JID {
+	var alt types.JID
+	var err error
+	switch jid.Server {
+	case types.HiddenUserServer:
+		alt, err = cli.Store.LIDs.GetPNForLID(ctx, jid)
+	case types.DefaultUserServer:
+		alt, err = cli.Store.LIDs.GetLIDForPN(ctx, jid)
+	}
+	if err != nil {
+		return types.JID{}
+	}
+	return alt
+}
+
+// resolveMissingContactLIDs asks the server for the LID of every phone-number
+// contact that has none stored, and stores the pairs (Vita patch).
+func (cli *Client) resolveMissingContactLIDs(ctx context.Context, contacts map[types.JID]types.ContactInfo) error {
+	var missing []types.JID
+	for jid := range contacts {
+		if jid.Server == types.DefaultUserServer && cli.altLIDOrPN(ctx, jid.ToNonAD()).IsEmpty() {
+			missing = append(missing, jid.ToNonAD())
+		}
+	}
+	for start := 0; start < len(missing); start += 100 {
+		end := min(start+100, len(missing))
+		infos, err := cli.GetUserInfo(ctx, missing[start:end])
+		if err != nil {
+			return err
+		}
+		for pn, info := range infos {
+			if !info.LID.IsEmpty() {
+				cli.StoreLIDPNMapping(ctx, info.LID, pn)
+			}
+		}
+	}
+	return nil
+}

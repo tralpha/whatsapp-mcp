@@ -2722,7 +2722,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 		}
 		// Privacy guard: refuse to post if anyone on the "my contacts except" list
 		// would still receive it (LID vs phone-number mismatch in the contact store).
-		if rep, err := statusRecipientReport(r.Context(), client); err != nil || len(rep.Leaked) > 0 {
+		if rep, err := statusRecipientReport(r.Context(), client); err != nil || len(rep.Leaked) > 0 || rep.Unverifiable > 0 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "status privacy check failed; nothing posted", "detail": fmt.Sprint(err), "report": rep})

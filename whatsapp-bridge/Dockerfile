@@ -3,6 +3,8 @@
 FROM golang:1.26-alpine AS builder
 WORKDIR /src
 COPY whatsapp-bridge/go.mod whatsapp-bridge/go.sum ./
+# Patched whatsmeow (status privacy fix) is a local replace: it must exist before download.
+COPY whatsapp-bridge/third_party ./third_party
 RUN go mod download
 COPY whatsapp-bridge/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/bridge .

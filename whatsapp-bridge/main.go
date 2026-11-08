@@ -2720,6 +2720,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			http.Error(w, "Not connected to WhatsApp", http.StatusServiceUnavailable)
 			return
 		}
+		// Privacy guard: refuse to post if anyone on the "my contacts except" list
+		// would still receive it (LID vs phone-number mismatch in the contact store).
+		if rep, err := statusRecipientReport(r.Context(), client); err != nil || len(rep.Leaked) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "status privacy check failed; nothing posted", "detail": fmt.Sprint(err), "report": rep})
+			return
+		}
 
 		// Text-only path
 		if req.MediaBase64 == "" {
@@ -2759,6 +2767,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 			respondStatusResult(w, fmt.Errorf("upload: %w", err), "")
 			return
 		}
+		// Without a thumbnail the status ring and viewer show a blank tile.
+		thumb, width, height, secs := mediaPreview(mediaBytes, mediaType == "video")
 		msg := &waProto.Message{}
 		switch mediaType {
 		case "image":
@@ -2766,16 +2776,33 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 				Caption: proto.String(req.Message), Mimetype: proto.String(mime),
 				URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 				FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
+				JPEGThumbnail: thumb, Width: optU32(width), Height: optU32(height),
 			}
 		case "video":
 			msg.VideoMessage = &waProto.VideoMessage{
 				Caption: proto.String(req.Message), Mimetype: proto.String(mime),
 				URL: &up.URL, DirectPath: &up.DirectPath, MediaKey: up.MediaKey,
 				FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: &up.FileLength,
+				JPEGThumbnail: thumb, Width: optU32(width), Height: optU32(height), Seconds: optU32(secs),
 			}
 		}
 		_, err = client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
 		respondStatusResult(w, err, fmt.Sprintf("status posted (%s, %d bytes)", mediaType, len(mediaBytes)))
+	})
+
+	// /api/status/recipients — dry run: who a status would reach right now, and
+	// whether anyone on the privacy exclude list leaks through. Posts nothing.
+	mux.HandleFunc("/api/status/recipients", func(w http.ResponseWriter, r *http.Request) {
+		if !client.IsConnected() {
+			http.Error(w, "Not connected to WhatsApp", http.StatusServiceUnavailable)
+			return
+		}
+		rep, err := statusRecipientReport(r.Context(), client)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"report": rep, "error": fmt.Sprint(err)})
 	})
 
 	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {

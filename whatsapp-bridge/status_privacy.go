@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
@@ -21,6 +23,7 @@ type StatusRecipientReport struct {
 	Leaked       []string `json:"leaked"`       // excluded people who would still receive it
 	Unverifiable int      `json:"unverifiable"` // recipients with no LID while some excluded person has no phone number on file
 	Withheld     int      `json:"withheld"`     // phone-number contacts held back because their LID is unknown
+	Unresolved   []string `json:"unresolved"`   // excluded people whose LID/phone twin is unknown (give their numbers via STATUS_RESOLVE_PN)
 }
 
 // statusRecipientReport checks every recipient under both its phone-number and
@@ -28,6 +31,7 @@ type StatusRecipientReport struct {
 // and the privacy list do not use the same form, so a literal comparison misses.
 func statusRecipientReport(ctx context.Context, cli *whatsmeow.Client) (StatusRecipientReport, error) {
 	var rep StatusRecipientReport
+	resolveConfiguredPNs(ctx, cli)
 	privacy, err := cli.GetStatusPrivacy(ctx)
 	if err != nil || len(privacy) == 0 {
 		return rep, err
@@ -51,6 +55,7 @@ func statusRecipientReport(ctx context.Context, cli *whatsmeow.Client) (StatusRe
 			excluded[alt] = j.User
 		} else {
 			lidOnly = true // either form unknown
+			rep.Unresolved = append(rep.Unresolved, j.String())
 		}
 	}
 	if lidOnly {
@@ -134,4 +139,35 @@ func optU32(v uint32) *uint32 {
 		return nil
 	}
 	return &v
+}
+
+// resolveConfiguredPNs looks up the LID of each phone number in STATUS_RESOLVE_PN
+// (comma-separated, digits only) that has no stored LID, and stores the pair.
+// Meant for the handful of excluded people the store cannot match; a few
+// numbers per call, never the whole contact list (bulk usync is rate limited).
+func resolveConfiguredPNs(ctx context.Context, cli *whatsmeow.Client) {
+	var missing []types.JID
+	for _, n := range strings.Split(os.Getenv("STATUS_RESOLVE_PN"), ",") {
+		n = strings.Trim(strings.TrimSpace(n), "+")
+		if n == "" {
+			continue
+		}
+		pn := types.NewJID(n, types.DefaultUserServer)
+		if alt, err := altJID(ctx, cli, pn); err != nil || alt.IsEmpty() {
+			missing = append(missing, pn)
+		}
+	}
+	if len(missing) == 0 || len(missing) > 50 {
+		return
+	}
+	infos, err := cli.GetUserInfo(ctx, missing)
+	if err != nil {
+		fmt.Println("STATUS_RESOLVE_PN lookup failed:", err)
+		return
+	}
+	for pn, info := range infos {
+		if !info.LID.IsEmpty() {
+			cli.StoreLIDPNMapping(ctx, info.LID, pn)
+		}
+	}
 }

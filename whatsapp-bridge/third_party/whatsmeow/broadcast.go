@@ -44,15 +44,41 @@ func (cli *Client) getBroadcastListParticipants(ctx context.Context, jid types.J
 	return list, nil
 }
 
+// StatusExtraExclude, when set, names extra people to keep off every status
+// on top of the account's own privacy setting (Vita patch).
+var StatusExtraExclude func(ctx context.Context) []types.JID
+
 func (cli *Client) getStatusBroadcastRecipients(ctx context.Context) ([]types.JID, error) {
 	statusPrivacyOptions, err := cli.GetStatusPrivacy(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get status privacy: %w", err)
 	}
 	statusPrivacy := statusPrivacyOptions[0]
+	var extra []types.JID
+	if StatusExtraExclude != nil {
+		extra = StatusExtraExclude(ctx)
+	}
 	if statusPrivacy.Type == types.StatusPrivacyTypeWhitelist {
-		// Whitelist mode, just return the list
-		return statusPrivacy.List, nil
+		// Whitelist mode, just return the list (minus the Vita extra excludes)
+		if len(extra) == 0 {
+			return statusPrivacy.List, nil
+		}
+		drop := make(map[types.JID]struct{})
+		for _, jid := range extra {
+			drop[jid.ToNonAD()] = struct{}{}
+			if alt := cli.altLIDOrPN(ctx, jid.ToNonAD()); !alt.IsEmpty() {
+				drop[alt] = struct{}{}
+			}
+		}
+		var kept []types.JID
+		for _, jid := range statusPrivacy.List {
+			_, a := drop[jid.ToNonAD()]
+			_, b := drop[cli.altLIDOrPN(ctx, jid.ToNonAD())]
+			if !a && !b {
+				kept = append(kept, jid)
+			}
+		}
+		return kept, nil
 	}
 
 	// Blacklist or all contacts mode. Find all contacts from database, then filter them appropriately.
@@ -69,8 +95,12 @@ func (cli *Client) getStatusBroadcastRecipients(ctx context.Context) ([]types.JI
 	// lookups: bulk usync for ~1800 contacts was rate limited (429).
 	blacklist := make(map[types.JID]struct{})
 	unresolvedExcluded := false // an excluded person whose other form (LID or PN) is unknown
+	excludeSrc := extra
 	if statusPrivacy.Type == types.StatusPrivacyTypeBlacklist {
-		for _, jid := range statusPrivacy.List {
+		excludeSrc = append(append([]types.JID{}, statusPrivacy.List...), extra...)
+	}
+	{
+		for _, jid := range excludeSrc {
 			jid = jid.ToNonAD()
 			blacklist[jid] = struct{}{}
 			if alt := cli.altLIDOrPN(ctx, jid); !alt.IsEmpty() {

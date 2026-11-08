@@ -33,3 +33,11 @@ func TestOptU32(t *testing.T) {
 		t.Fatal("optU32")
 	}
 }
+
+func TestStatusExtraExclude(t *testing.T) {
+	t.Setenv("STATUS_EXTRA_EXCLUDE", " +85264176867, ,237655000000 ")
+	got := statusExtraExclude(nil)
+	if len(got) != 2 || got[0].User != "85264176867" || got[1].String() != "237655000000@s.whatsapp.net" {
+		t.Fatalf("got %v", got)
+	}
+}

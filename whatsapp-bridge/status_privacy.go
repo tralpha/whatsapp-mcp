@@ -17,13 +17,14 @@ import (
 // StatusRecipientReport is what a status post would reach, computed the same way
 // the (patched) library does it, plus an independent leak check.
 type StatusRecipientReport struct {
-	PrivacyType  string   `json:"privacy_type"` // contacts | blacklist | whitelist
-	ListCount    int      `json:"list_count"`   // people on the except/only list
-	Recipients   int      `json:"recipients"`   // people the status goes to
-	Leaked       []string `json:"leaked"`       // excluded people who would still receive it
-	Unverifiable int      `json:"unverifiable"` // recipients with no LID while some excluded person has no phone number on file
-	Withheld     int      `json:"withheld"`     // phone-number contacts held back because their LID is unknown
-	Unresolved   []string `json:"unresolved"`   // excluded people whose LID/phone twin is unknown (give their numbers via STATUS_RESOLVE_PN)
+	PrivacyType   string   `json:"privacy_type"`   // contacts | blacklist | whitelist
+	ListCount     int      `json:"list_count"`     // people on the except/only list
+	Recipients    int      `json:"recipients"`     // people the status goes to
+	Leaked        []string `json:"leaked"`         // excluded people who would still receive it
+	Unverifiable  int      `json:"unverifiable"`   // recipients with no LID while some excluded person has no phone number on file
+	Withheld      int      `json:"withheld"`       // phone-number contacts held back because their LID is unknown
+	Unresolved    []string `json:"unresolved"`     // excluded people whose LID/phone twin is unknown (give their numbers via STATUS_RESOLVE_PN)
+	ExtraExcluded int      `json:"extra_excluded"` // numbers in STATUS_EXTRA_EXCLUDE
 }
 
 // statusRecipientReport checks every recipient under both its phone-number and
@@ -43,12 +44,18 @@ func statusRecipientReport(ctx context.Context, cli *whatsmeow.Client) (StatusRe
 		return rep, err
 	}
 	rep.Recipients = len(recipients)
-	if p.Type != types.StatusPrivacyTypeBlacklist || len(p.List) == 0 {
+	extra := statusExtraExclude(ctx)
+	if p.Type != types.StatusPrivacyTypeBlacklist && len(extra) == 0 {
 		return rep, nil
 	}
+	src := extra
+	if p.Type == types.StatusPrivacyTypeBlacklist {
+		src = append(append([]types.JID{}, p.List...), extra...)
+	}
+	rep.ExtraExcluded = len(extra)
 	excluded := map[types.JID]string{}
-	lidOnly := false // an excluded person known only by LID
-	for _, j := range p.List {
+	lidOnly := false // an excluded person whose other form is unknown
+	for _, j := range src {
 		j = j.ToNonAD()
 		excluded[j] = j.User
 		if alt, err := altJID(ctx, cli, j); err == nil && !alt.IsEmpty() {
@@ -147,7 +154,7 @@ func optU32(v uint32) *uint32 {
 // numbers per call, never the whole contact list (bulk usync is rate limited).
 func resolveConfiguredPNs(ctx context.Context, cli *whatsmeow.Client) {
 	var missing []types.JID
-	for _, n := range strings.Split(os.Getenv("STATUS_RESOLVE_PN"), ",") {
+	for _, n := range strings.Split(os.Getenv("STATUS_RESOLVE_PN")+","+os.Getenv("STATUS_EXTRA_EXCLUDE"), ",") {
 		n = strings.Trim(strings.TrimSpace(n), "+")
 		if n == "" {
 			continue
@@ -171,3 +178,20 @@ func resolveConfiguredPNs(ctx context.Context, cli *whatsmeow.Client) {
 		}
 	}
 }
+
+// statusExtraExclude parses STATUS_EXTRA_EXCLUDE (comma-separated phone numbers):
+// people hidden from every status this bridge posts, on top of the phone's
+// "my contacts except" list. Read on every call, so a variable change applies
+// as soon as Railway restarts the bridge.
+func statusExtraExclude(_ context.Context) []types.JID {
+	var out []types.JID
+	for _, n := range strings.Split(os.Getenv("STATUS_EXTRA_EXCLUDE"), ",") {
+		n = strings.Trim(strings.TrimSpace(n), "+")
+		if n != "" {
+			out = append(out, types.NewJID(n, types.DefaultUserServer))
+		}
+	}
+	return out
+}
+
+func init() { whatsmeow.StatusExtraExclude = statusExtraExclude }

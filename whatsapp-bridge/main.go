@@ -1840,6 +1840,15 @@ func mimeForMediaType(mediaType, filename string) string {
 }
 
 // respondStatusResult writes a uniform JSON response for /api/status.
+func respondStatusPosted(w http.ResponseWriter, err error, id, okMsg string) {
+	if err != nil {
+		respondStatusResult(w, err, "")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "message": okMsg, "message_id": id})
+}
+
 func respondStatusResult(w http.ResponseWriter, err error, okMsg string) {
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
@@ -2732,8 +2741,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 		// Text-only path
 		if req.MediaBase64 == "" {
 			msg := &waProto.Message{Conversation: proto.String(req.Message)}
-			_, err := client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
-			respondStatusResult(w, err, "status posted (text)")
+			resp, err := client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
+			respondStatusPosted(w, err, resp.ID, "status posted (text)")
 			return
 		}
 
@@ -2786,8 +2795,25 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, retry
 				JPEGThumbnail: thumb, Width: optU32(width), Height: optU32(height), Seconds: optU32(secs),
 			}
 		}
-		_, err = client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
-		respondStatusResult(w, err, fmt.Sprintf("status posted (%s, %d bytes)", mediaType, len(mediaBytes)))
+		resp, err := client.SendMessage(context.Background(), types.StatusBroadcastJID, msg)
+		respondStatusPosted(w, err, resp.ID, fmt.Sprintf("status posted (%s, %d bytes)", mediaType, len(mediaBytes)))
+	})
+
+	// /api/status/delete — delete one of our statuses for everyone. Body: {"message_id": "..."}
+	mux.HandleFunc("/api/status/delete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			MessageID string `json:"message_id"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil || req.MessageID == "" {
+			http.Error(w, "message_id required", http.StatusBadRequest)
+			return
+		}
+		_, err := client.SendMessage(r.Context(), types.StatusBroadcastJID, client.BuildRevoke(types.StatusBroadcastJID, types.EmptyJID, req.MessageID))
+		respondStatusResult(w, err, "status deleted "+req.MessageID)
 	})
 
 	// /api/status/recipients — dry run: who a status would reach right now, and

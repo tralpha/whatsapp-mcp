@@ -49,15 +49,15 @@ func statusRecipientReport(ctx context.Context, cli *whatsmeow.Client) (StatusRe
 		excluded[j] = j.User
 		if alt, err := altJID(ctx, cli, j); err == nil && !alt.IsEmpty() {
 			excluded[alt] = j.User
-		} else if j.Server == types.HiddenUserServer {
-			lidOnly = true
+		} else {
+			lidOnly = true // either form unknown
 		}
 	}
 	if lidOnly {
 		if contacts, err := cli.Store.Contacts.GetAllContacts(ctx); err == nil {
 			for c, info := range contacts {
 				c = c.ToNonAD()
-				if info.FullName == "" || c.Server != types.DefaultUserServer {
+				if info.FullName == "" {
 					continue
 				}
 				if alt, err := altJID(ctx, cli, c); err != nil || alt.IsEmpty() {
@@ -73,7 +73,7 @@ func statusRecipientReport(ctx context.Context, cli *whatsmeow.Client) (StatusRe
 			rep.Leaked = append(rep.Leaked, who)
 		} else if who, ok := excluded[alt]; aerr == nil && ok {
 			rep.Leaked = append(rep.Leaked, who)
-		} else if lidOnly && r.Server == types.DefaultUserServer && (aerr != nil || alt.IsEmpty()) {
+		} else if lidOnly && (aerr != nil || alt.IsEmpty()) {
 			rep.Unverifiable++
 		}
 	}

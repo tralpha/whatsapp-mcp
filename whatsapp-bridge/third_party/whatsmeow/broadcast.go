@@ -64,19 +64,19 @@ func (cli *Client) getStatusBroadcastRecipients(ctx context.Context) ([]types.JI
 	// Vita patch (2026-11-08): the exclude list can name a person by LID while the
 	// contact store keys them by phone number (or the reverse), and a literal match
 	// would have sent statuses to 19 of 23 excluded people. Index both forms from
-	// the stored LID<->PN pairs. If an excluded person is known only by LID, any
-	// phone-number contact whose LID is unknown is withheld (fail closed). No server
+	// the stored LID<->PN pairs. If any excluded person's other form is unknown,
+	// every contact whose other form is unknown is withheld (fail closed). No server
 	// lookups: bulk usync for ~1800 contacts was rate limited (429).
 	blacklist := make(map[types.JID]struct{})
-	lidOnlyExcluded := false
+	unresolvedExcluded := false // an excluded person whose other form (LID or PN) is unknown
 	if statusPrivacy.Type == types.StatusPrivacyTypeBlacklist {
 		for _, jid := range statusPrivacy.List {
 			jid = jid.ToNonAD()
 			blacklist[jid] = struct{}{}
 			if alt := cli.altLIDOrPN(ctx, jid); !alt.IsEmpty() {
 				blacklist[alt] = struct{}{}
-			} else if jid.Server == types.HiddenUserServer {
-				lidOnlyExcluded = true
+			} else {
+				unresolvedExcluded = true
 			}
 		}
 	}
@@ -89,8 +89,8 @@ func (cli *Client) getStatusBroadcastRecipients(ctx context.Context) ([]types.JI
 			alt := cli.altLIDOrPN(ctx, jid)
 			if !alt.IsEmpty() {
 				_, isBlacklisted = blacklist[alt]
-			} else if lidOnlyExcluded && jid.Server == types.DefaultUserServer {
-				isBlacklisted = true // cannot prove this is not an excluded person
+			} else if unresolvedExcluded {
+				isBlacklisted = true // either form unknown: cannot prove this is not an excluded person
 			}
 		}
 		if isBlacklisted {
